@@ -4,10 +4,12 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
+const FREE_PAIRING_LIMIT = 3;
 
 app.use(cors());
 app.use(express.json());
@@ -19,6 +21,8 @@ const userSchema = new mongoose.Schema(
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true },
+    pairingCount: { type: Number, default: 0 },
+    isPremium: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -105,6 +109,45 @@ app.delete('/api/users/:id', async (req, res) => {
     res.json({ message: 'User deleted' });
   } catch (err) {
     res.status(400).json({ error: 'Invalid user id' });
+  }
+});
+
+// Pairing usage (free-tier enforcement for the AI plan generator)
+app.post('/api/pairing-usage/check', async (req, res) => {
+  try {
+    const { email, name } = req.body;
+    if (!email) return res.status(400).json({ error: 'email is required' });
+
+    const normalizedEmail = email.toLowerCase().trim();
+    let user = await User.findOne({ email: normalizedEmail });
+    if (!user) {
+      const placeholderPassword = await bcrypt.hash(crypto.randomUUID(), 10);
+      user = await User.create({ name: name || normalizedEmail, email: normalizedEmail, password: placeholderPassword });
+    }
+
+    const allowed = user.isPremium || user.pairingCount < FREE_PAIRING_LIMIT;
+    res.json({ allowed, pairingCount: user.pairingCount, isPremium: user.isPremium });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/pairing-usage/increment', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email is required' });
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOneAndUpdate(
+      { email: normalizedEmail },
+      { $inc: { pairingCount: 1 } },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    res.json({ pairingCount: user.pairingCount, isPremium: user.isPremium });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
