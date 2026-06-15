@@ -3,16 +3,62 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const FREE_PAIRING_LIMIT = 1;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_PASSWORD_LENGTH = 8;
 
+app.set('trust proxy', 1);
+// contentSecurityPolicy/CORP are tuned off/loosened: this is a JSON API with
+// no HTML to protect, and tightening CORP breaks cross-origin fetch() from
+// the frontend's different Vercel origin.
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors());
 app.use(express.json());
+
+// Baseline abuse protection on every API route, per IP.
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again later.' },
+});
+app.use('/api', apiLimiter);
+
+// Stricter limiter on account creation to slow brute-force/spam signups.
+const signupLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many accounts created from this IP. Please try again later.' },
+});
+
+// Gates admin-only endpoints (user directory, subscriber export, meals CRUD).
+// Fails closed if ADMIN_API_KEY isn't configured, so these never end up
+// accidentally public in an environment that forgot to set it.
+function requireAdmin(req, res, next) {
+  if (!ADMIN_API_KEY) return res.status(503).json({ error: 'Admin API is not configured' });
+  if (req.headers['x-admin-key'] !== ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+// Gates service-to-service endpoints called only by nutricrew-backend.
+function requireInternal(req, res, next) {
+  if (!INTERNAL_API_KEY) return res.status(503).json({ error: 'Internal API is not configured' });
+  if (req.headers['x-internal-key'] !== INTERNAL_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
 
 // --- Models ---
 
@@ -50,11 +96,17 @@ app.get('/', (req, res) => {
 });
 
 // Users
-app.post('/api/users', async (req, res) => {
+app.post('/api/users', signupLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body;
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'name, email and password are required' });
+    }
+    if (!EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
     }
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = await User.create({ name, email, password: hashedPassword });
@@ -64,20 +116,22 @@ app.post('/api/users', async (req, res) => {
     if (err.code === 11000) {
       return res.status(409).json({ error: 'Email already in use' });
     }
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/users', async (req, res) => {
+app.get('/api/users', requireAdmin, async (req, res) => {
   try {
     const users = await User.find().select('-password');
     res.json(users);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/users/:id', async (req, res) => {
+app.get('/api/users/:id', requireAdmin, async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select('-password');
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -87,7 +141,7 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-app.put('/api/users/:id', async (req, res) => {
+app.put('/api/users/:id', requireAdmin, async (req, res) => {
   try {
     const { name, email } = req.body;
     const user = await User.findByIdAndUpdate(
@@ -98,11 +152,14 @@ app.put('/api/users/:id', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json(user);
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'Email already in use' });
+    }
     res.status(400).json({ error: err.message });
   }
 });
 
-app.delete('/api/users/:id', async (req, res) => {
+app.delete('/api/users/:id', requireAdmin, async (req, res) => {
   try {
     const user = await User.findByIdAndDelete(req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -112,11 +169,27 @@ app.delete('/api/users/:id', async (req, res) => {
   }
 });
 
+// Subscribers (name + email of every crew member who has checked in)
+app.get('/api/subscribers', requireAdmin, async (req, res) => {
+  try {
+    const subscribers = await User.find()
+      .select('name email pairingCount isPremium createdAt -_id')
+      .sort({ createdAt: -1 });
+    res.json(subscribers);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Pairing usage (free-tier enforcement for the AI plan generator)
-app.post('/api/pairing-usage/check', async (req, res) => {
+app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
   try {
     const { email, name } = req.body;
     if (!email) return res.status(400).json({ error: 'email is required' });
+    if (typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
 
     const normalizedEmail = email.toLowerCase().trim();
     let user = await User.findOne({ email: normalizedEmail });
@@ -128,14 +201,18 @@ app.post('/api/pairing-usage/check', async (req, res) => {
     const allowed = user.isPremium || user.pairingCount < FREE_PAIRING_LIMIT;
     res.json({ allowed, pairingCount: user.pairingCount, isPremium: user.isPremium });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/pairing-usage/increment', async (req, res) => {
+app.post('/api/pairing-usage/increment', requireInternal, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'email is required' });
+    if (typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
 
     const normalizedEmail = email.toLowerCase().trim();
     const user = await User.findOneAndUpdate(
@@ -147,12 +224,13 @@ app.post('/api/pairing-usage/increment', async (req, res) => {
 
     res.json({ pairingCount: user.pairingCount, isPremium: user.isPremium });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Meals
-app.post('/api/meals', async (req, res) => {
+// Meals (not used by the live app — admin-only CRUD scaffold)
+app.post('/api/meals', requireAdmin, async (req, res) => {
   try {
     const { name, calories, protein, carbs, fats, user } = req.body;
     if (!name || calories === undefined) {
@@ -165,16 +243,17 @@ app.post('/api/meals', async (req, res) => {
   }
 });
 
-app.get('/api/meals', async (req, res) => {
+app.get('/api/meals', requireAdmin, async (req, res) => {
   try {
     const meals = await Meal.find();
     res.json(meals);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/meals/:id', async (req, res) => {
+app.get('/api/meals/:id', requireAdmin, async (req, res) => {
   try {
     const meal = await Meal.findById(req.params.id);
     if (!meal) return res.status(404).json({ error: 'Meal not found' });
@@ -184,12 +263,14 @@ app.get('/api/meals/:id', async (req, res) => {
   }
 });
 
-app.put('/api/meals/:id', async (req, res) => {
+app.put('/api/meals/:id', requireAdmin, async (req, res) => {
   try {
-    const meal = await Meal.findByIdAndUpdate(req.params.id, req.body, {
-      new: true,
-      runValidators: true,
-    });
+    const { name, calories, protein, carbs, fats, user } = req.body;
+    const meal = await Meal.findByIdAndUpdate(
+      req.params.id,
+      { name, calories, protein, carbs, fats, user },
+      { new: true, runValidators: true }
+    );
     if (!meal) return res.status(404).json({ error: 'Meal not found' });
     res.json(meal);
   } catch (err) {
@@ -197,7 +278,7 @@ app.put('/api/meals/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/meals/:id', async (req, res) => {
+app.delete('/api/meals/:id', requireAdmin, async (req, res) => {
   try {
     const meal = await Meal.findByIdAndDelete(req.params.id);
     if (!meal) return res.status(404).json({ error: 'Meal not found' });
@@ -205,6 +286,26 @@ app.delete('/api/meals/:id', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: 'Invalid meal id' });
   }
+});
+
+// --- Error handling ---
+
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Catches malformed JSON bodies and anything else that escapes a route's own
+// try/catch, so Express's default handler (which can include stack traces
+// when NODE_ENV isn't "production") never sends raw error details to clients.
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Invalid JSON in request body' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body too large' });
+  }
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 // --- Startup ---
