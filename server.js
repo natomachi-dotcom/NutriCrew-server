@@ -9,7 +9,7 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
-const FREE_PAIRING_LIMIT = 3;
+const FREE_PAIRING_LIMIT = 1;
 
 app.use(cors());
 app.use(express.json());
