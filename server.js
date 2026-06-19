@@ -69,6 +69,8 @@ const userSchema = new mongoose.Schema(
     password: { type: String, required: true },
     pairingCount: { type: Number, default: 0 },
     isPremium: { type: Boolean, default: false },
+    emailVerified: { type: Boolean, default: false },
+    registeredIP: { type: String, default: null },
     otpHash: { type: String, default: null },
     otpExpiry: { type: Date, default: null },
     otpAttempts: { type: Number, default: 0 },
@@ -197,10 +199,21 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
     }
 
     const normalizedEmail = email.toLowerCase().trim();
+    const { clientIP } = req.body;
+
     let user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       const placeholderPassword = await bcrypt.hash(crypto.randomUUID(), 10);
       user = await User.create({ name: name || normalizedEmail, email: normalizedEmail, password: placeholderPassword });
+    }
+
+    // IP enforcement: if this IP already has a DIFFERENT user who hit the limit,
+    // apply that user's count to the requesting email too.
+    if (clientIP && !user.isPremium) {
+      const ipOwner = await User.findOne({ registeredIP: clientIP, emailVerified: true });
+      if (ipOwner && ipOwner.email !== normalizedEmail && !ipOwner.isPremium && ipOwner.pairingCount >= FREE_PAIRING_LIMIT) {
+        return res.json({ allowed: false, pairingCount: ipOwner.pairingCount, isPremium: false, ipBlocked: true });
+      }
     }
 
     const allowed = user.isPremium || user.pairingCount < FREE_PAIRING_LIMIT;
@@ -241,9 +254,18 @@ const otpLimiter = rateLimit({
 
 app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) => {
   try {
-    const { email, otpHash } = req.body;
+    const { email, otpHash, clientIP } = req.body;
     if (!email || !otpHash) return res.status(400).json({ error: 'email and otpHash are required' });
     const normalizedEmail = email.toLowerCase().trim();
+
+    // Block if another verified account is already registered from this IP.
+    if (clientIP) {
+      const ipOwner = await User.findOne({ registeredIP: clientIP, emailVerified: true });
+      if (ipOwner && ipOwner.email !== normalizedEmail) {
+        return res.status(403).json({ error: 'An account is already linked to this device. Please use that email to sign in.' });
+      }
+    }
+
     const expiry = new Date(Date.now() + 10 * 60 * 1000);
     let user = await User.findOne({ email: normalizedEmail });
     if (!user) {
@@ -260,7 +282,7 @@ app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) =>
 
 app.post('/api/auth/check-otp', requireInternal, async (req, res) => {
   try {
-    const { email, otpHash } = req.body;
+    const { email, otpHash, clientIP } = req.body;
     if (!email || !otpHash) return res.status(400).json({ error: 'email and otpHash are required' });
     const normalizedEmail = email.toLowerCase().trim();
     const user = await User.findOne({ email: normalizedEmail });
@@ -278,12 +300,16 @@ app.post('/api/auth/check-otp', requireInternal, async (req, res) => {
       const attemptsLeft = 4 - user.otpAttempts;
       return res.status(401).json({ error: `Incorrect code. ${attemptsLeft > 0 ? `${attemptsLeft} attempt(s) left.` : 'Please request a new code.'}` });
     }
+    // OTP correct — mark verified, lock IP, issue permanent session token.
     const sessionToken = crypto.randomBytes(32).toString('hex');
-    const sessionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-    await User.updateOne({ email: normalizedEmail }, {
+    const updates = {
       otpHash: null, otpExpiry: null, otpAttempts: 0,
-      sessionToken, sessionExpiry,
-    });
+      emailVerified: true,
+      sessionToken,
+      sessionExpiry: null, // permanent
+    };
+    if (clientIP && !user.registeredIP) updates.registeredIP = clientIP;
+    await User.updateOne({ email: normalizedEmail }, updates);
     res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount });
   } catch (err) {
     console.error(err);
@@ -296,8 +322,11 @@ app.post('/api/auth/check-session', requireInternal, async (req, res) => {
     const { token } = req.body;
     if (!token) return res.status(401).json({ error: 'No token provided' });
     const user = await User.findOne({ sessionToken: token });
-    if (!user || !user.sessionExpiry || new Date() > user.sessionExpiry) {
-      return res.status(401).json({ error: 'Session expired or invalid. Please log in again.' });
+    // Verified users have a permanent session (sessionExpiry: null).
+    // Legacy sessions with an expiry date are still honored until they expire.
+    if (!user) return res.status(401).json({ error: 'Invalid session. Please log in again.' });
+    if (user.sessionExpiry && new Date() > user.sessionExpiry) {
+      return res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
     res.json({ email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount });
   } catch (err) {
