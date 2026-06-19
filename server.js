@@ -266,14 +266,22 @@ app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) =>
       }
     }
 
-    const expiry = new Date(Date.now() + 10 * 60 * 1000);
     let user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       const ph = await bcrypt.hash(crypto.randomUUID(), 10);
       user = await User.create({ name: normalizedEmail.split('@')[0], email: normalizedEmail, password: ph });
     }
+
+    // Already verified — skip OTP, issue a fresh session immediately.
+    if (user.emailVerified) {
+      const sessionToken = crypto.randomBytes(32).toString('hex');
+      await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null });
+      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount });
+    }
+
+    const expiry = new Date(Date.now() + 10 * 60 * 1000);
     await User.updateOne({ email: normalizedEmail }, { otpHash, otpExpiry: expiry, otpAttempts: 0 });
-    res.json({ ok: true });
+    res.json({ alreadyVerified: false });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
