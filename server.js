@@ -206,6 +206,25 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
   }
 });
 
+app.post('/api/set-premium', requireInternal, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: 'Missing or invalid email' });
+    }
+    const user = await User.findOneAndUpdate(
+      { email: email.toLowerCase().trim() },
+      { isPremium: true },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ isPremium: user.isPremium });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.post('/api/pairing-usage/increment', requireInternal, async (req, res) => {
   try {
     const { email } = req.body;
