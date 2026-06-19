@@ -69,6 +69,11 @@ const userSchema = new mongoose.Schema(
     password: { type: String, required: true },
     pairingCount: { type: Number, default: 0 },
     isPremium: { type: Boolean, default: false },
+    otpHash: { type: String, default: null },
+    otpExpiry: { type: Date, default: null },
+    otpAttempts: { type: Number, default: 0 },
+    sessionToken: { type: String, default: null },
+    sessionExpiry: { type: Date, default: null },
   },
   { timestamps: true }
 );
@@ -219,6 +224,82 @@ app.post('/api/set-premium', requireInternal, async (req, res) => {
     );
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({ isPremium: user.isPremium });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Internal auth endpoints called by nutricrew-backend
+const otpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many OTP requests. Please try again later.' },
+});
+
+app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) => {
+  try {
+    const { email, otpHash } = req.body;
+    if (!email || !otpHash) return res.status(400).json({ error: 'email and otpHash are required' });
+    const normalizedEmail = email.toLowerCase().trim();
+    const expiry = new Date(Date.now() + 10 * 60 * 1000);
+    let user = await User.findOne({ email: normalizedEmail });
+    if (!user) {
+      const ph = await bcrypt.hash(crypto.randomUUID(), 10);
+      user = await User.create({ name: normalizedEmail.split('@')[0], email: normalizedEmail, password: ph });
+    }
+    await User.updateOne({ email: normalizedEmail }, { otpHash, otpExpiry: expiry, otpAttempts: 0 });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/check-otp', requireInternal, async (req, res) => {
+  try {
+    const { email, otpHash } = req.body;
+    if (!email || !otpHash) return res.status(400).json({ error: 'email and otpHash are required' });
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user || !user.otpHash || !user.otpExpiry) {
+      return res.status(400).json({ error: 'No code found. Please request a new one.' });
+    }
+    if (user.otpAttempts >= 5) {
+      return res.status(429).json({ error: 'Too many attempts. Please request a new code.' });
+    }
+    if (new Date() > user.otpExpiry) {
+      return res.status(400).json({ error: 'Code expired. Please request a new one.' });
+    }
+    if (user.otpHash !== otpHash) {
+      await User.updateOne({ email: normalizedEmail }, { $inc: { otpAttempts: 1 } });
+      const attemptsLeft = 4 - user.otpAttempts;
+      return res.status(401).json({ error: `Incorrect code. ${attemptsLeft > 0 ? `${attemptsLeft} attempt(s) left.` : 'Please request a new code.'}` });
+    }
+    const sessionToken = crypto.randomBytes(32).toString('hex');
+    const sessionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await User.updateOne({ email: normalizedEmail }, {
+      otpHash: null, otpExpiry: null, otpAttempts: 0,
+      sessionToken, sessionExpiry,
+    });
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/check-session', requireInternal, async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    const user = await User.findOne({ sessionToken: token });
+    if (!user || !user.sessionExpiry || new Date() > user.sessionExpiry) {
+      return res.status(401).json({ error: 'Session expired or invalid. Please log in again.' });
+    }
+    res.json({ email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
