@@ -76,11 +76,26 @@ const userSchema = new mongoose.Schema(
     otpAttempts: { type: Number, default: 0 },
     sessionToken: { type: String, default: null },
     sessionExpiry: { type: Date, default: null },
+    seenDayIds: [{ type: mongoose.Schema.Types.ObjectId }],
   },
   { timestamps: true }
 );
 
 const User = mongoose.model('User', userSchema);
+
+const cachedDaySchema = new mongoose.Schema({
+  dietKey:          { type: String, index: true },
+  goalKey:          { type: String, index: true },
+  budgetLevel:      String,
+  kitchenKey:       String,
+  calorieTargetKey: String,
+  lang:             String,
+  meals:            [mongoose.Schema.Types.Mixed],
+  totalCalories:    Number,
+  useCount:         { type: Number, default: 0 },
+}, { timestamps: true });
+cachedDaySchema.index({ dietKey: 1, goalKey: 1, budgetLevel: 1, kitchenKey: 1, calorieTargetKey: 1, lang: 1 });
+const CachedDay = mongoose.model('CachedDay', cachedDaySchema);
 
 const mealSchema = new mongoose.Schema(
   {
@@ -426,6 +441,57 @@ app.delete('/api/meals/:id', requireAdmin, async (req, res) => {
 });
 
 // --- Error handling ---
+
+// ── MEAL CACHE ENDPOINTS (internal) ──────────────────────────────
+
+// Query unseen cached days for a user matching their profile key
+app.post('/api/meal-cache/query', requireInternal, async (req, res) => {
+  try {
+    const { email, dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang, count } = req.body;
+    const user = await User.findOne({ email }).select('seenDayIds').lean();
+    const seenIds = user?.seenDayIds || [];
+    const days = await CachedDay.find({
+      dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang,
+      _id: { $nin: seenIds },
+    }).limit(count || 7).lean();
+    const total = await CachedDay.countDocuments({ dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang });
+    res.json({ days, total });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Store newly generated days into cache
+app.post('/api/meal-cache/store', requireInternal, async (req, res) => {
+  try {
+    const { days, dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang } = req.body;
+    if (!Array.isArray(days) || days.length === 0) return res.json({ stored: 0, ids: [] });
+    const docs = await CachedDay.insertMany(
+      days.map(d => ({ meals: d.meals, totalCalories: d.totalCalories, dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang }))
+    );
+    res.json({ stored: docs.length, ids: docs.map(d => String(d._id)) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Mark cached day IDs as seen for a user (and increment usage counters)
+app.post('/api/meal-cache/mark-seen', requireInternal, async (req, res) => {
+  try {
+    const { email, dayIds } = req.body;
+    if (!email || !Array.isArray(dayIds) || dayIds.length === 0) return res.json({ ok: true });
+    await Promise.all([
+      User.updateOne({ email }, { $addToSet: { seenDayIds: { $each: dayIds } } }),
+      CachedDay.updateMany({ _id: { $in: dayIds } }, { $inc: { useCount: 1 } }),
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
