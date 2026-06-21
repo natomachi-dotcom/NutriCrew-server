@@ -97,6 +97,27 @@ const cachedDaySchema = new mongoose.Schema({
 cachedDaySchema.index({ dietKey: 1, goalKey: 1, budgetLevel: 1, kitchenKey: 1, calorieTargetKey: 1, lang: 1 });
 const CachedDay = mongoose.model('CachedDay', cachedDaySchema);
 
+const cachedExtrasSchema = new mongoose.Schema({
+  dietKey:          String,
+  goalKey:          String,
+  budgetLevel:      String,
+  kitchenKey:       String,
+  calorieTargetKey: String,
+  lang:             String,
+  destinationKey:   String,
+  goingUsa:         String,
+  pairingDays:      Number,
+  summary:          String,
+  groceryList:      mongoose.Schema.Types.Mixed,
+  foodRestrictions: mongoose.Schema.Types.Mixed,
+}, { timestamps: true });
+cachedExtrasSchema.index(
+  { dietKey:1, goalKey:1, budgetLevel:1, kitchenKey:1, calorieTargetKey:1, lang:1, destinationKey:1, goingUsa:1, pairingDays:1 },
+  { unique: true }
+);
+cachedExtrasSchema.index({ createdAt: 1 }, { expireAfterSeconds: 604800 }); // 7-day TTL
+const CachedExtras = mongoose.model('CachedExtras', cachedExtrasSchema);
+
 const mealSchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
@@ -486,6 +507,36 @@ app.post('/api/meal-cache/mark-seen', requireInternal, async (req, res) => {
       User.updateOne({ email }, { $addToSet: { seenDayIds: { $each: dayIds } } }),
       CachedDay.updateMany({ _id: { $in: dayIds } }, { $inc: { useCount: 1 } }),
     ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── EXTRAS CACHE ──────────────────────────────────────────────────────────────
+
+app.post('/api/extras-cache/query', requireInternal, async (req, res) => {
+  try {
+    const { dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang, destinationKey, goingUsa, pairingDays } = req.body;
+    const doc = await CachedExtras.findOne(
+      { dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang, destinationKey, goingUsa, pairingDays }
+    ).lean();
+    res.json({ hit: !!doc, extras: doc ? { summary: doc.summary, groceryList: doc.groceryList, foodRestrictions: doc.foodRestrictions } : null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/extras-cache/store', requireInternal, async (req, res) => {
+  try {
+    const { dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang, destinationKey, goingUsa, pairingDays, summary, groceryList, foodRestrictions } = req.body;
+    await CachedExtras.findOneAndUpdate(
+      { dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang, destinationKey, goingUsa, pairingDays },
+      { $set: { summary, groceryList, foodRestrictions, createdAt: new Date() } },
+      { upsert: true, new: true }
+    );
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
