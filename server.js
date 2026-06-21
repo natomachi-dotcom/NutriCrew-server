@@ -7,6 +7,7 @@ const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+const webpush = require('web-push');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,7 +16,12 @@ const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const AI_API_BASE = process.env.AI_API_BASE || "https://nutricrew-backend.vercel.app";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://nutricrew-frontend.vercel.app";
+const CRUD_SELF_URL = process.env.CRUD_SELF_URL || "https://nutricrew-server-1.onrender.com";
 const FREE_PAIRING_LIMIT = 1;
+
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails('mailto:renatogadeabi@gmail.com', process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
+}
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -155,6 +161,26 @@ const mealSchema = new mongoose.Schema(
 );
 
 const Meal = mongoose.model('Meal', mealSchema);
+
+const pushSubscriptionSchema = new mongoose.Schema({
+  email: { type: String, index: true },
+  subscription: { type: mongoose.Schema.Types.Mixed },
+}, { timestamps: true });
+const PushSubscription = mongoose.model('PushSubscription', pushSubscriptionSchema);
+
+async function sendPushToEmail(email, payload) {
+  if (!process.env.VAPID_PUBLIC_KEY) return;
+  const subs = await PushSubscription.find({ email }).lean();
+  for (const sub of subs) {
+    try {
+      await webpush.sendNotification(sub.subscription, JSON.stringify(payload));
+    } catch (err) {
+      if (err.statusCode === 410 || err.statusCode === 404) {
+        await PushSubscription.deleteOne({ _id: sub._id });
+      }
+    }
+  }
+}
 
 // --- Routes ---
 
@@ -613,6 +639,23 @@ app.post('/api/roster/send-reminders', requireInternal, async (req, res) => {
         if (r.ok) {
           await ScheduledPairing.updateOne({ _id: p._id }, { $set: { reminderSentAt: new Date() } });
           sent++;
+          // Fire push notification alongside the email
+          const pushDest = (p.destinations || []).join(' → ') || 'your destination';
+          sendPushToEmail(p.email, {
+            title: `✈️ ${pushDest} is tomorrow`,
+            body: "What's your kitchen? Tap to confirm — your meal plan is ready in 30 seconds.",
+            data: {
+              url: `${CRUD_SELF_URL}/api/roster/kitchen-select?token=${p.confirmToken}`,
+              kitchenUrls: {
+                hotel: `${CRUD_SELF_URL}/api/roster/confirm-kitchen?token=${p.confirmToken}&kitchen=hotel`,
+                airplane: `${CRUD_SELF_URL}/api/roster/confirm-kitchen?token=${p.confirmToken}&kitchen=airplane_food`,
+              },
+            },
+            actions: [
+              { action: 'hotel', title: '🏨 Hotel' },
+              { action: 'airplane', title: '✈️ Crew Meals' },
+            ],
+          }).catch(e => console.error('Push failed for', p.email, e.message));
         }
       } catch (e) { console.error('Reminder send failed for', p.email, e.message); }
     }
@@ -684,6 +727,42 @@ app.get('/api/roster/confirm-kitchen', async (req, res) => {
     console.error(err);
     res.status(500).send('<h2>Something went wrong. Please try again.</h2>');
   }
+});
+
+// ── PUSH NOTIFICATIONS ────────────────────────────────────────────────────────
+
+app.post('/api/push/subscribe', requireInternal, async (req, res) => {
+  const { email, subscription } = req.body;
+  if (!email || !subscription) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    await PushSubscription.findOneAndUpdate({ email }, { email, subscription }, { upsert: true });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('push/subscribe error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Public kitchen-select page — same design as reminder email, opened when user taps push notification
+app.get('/api/roster/kitchen-select', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('<h2>Invalid link.</h2>');
+  let dest = 'your pairing';
+  try {
+    const pairing = await ScheduledPairing.findOne({ confirmToken: token }).lean();
+    if (!pairing) return res.status(404).send('<h2>Link expired or not found.</h2>');
+    dest = pairing.destinations?.join(' → ') || dest;
+  } catch {}
+  const kitchenOptions = [
+    { key: 'hotel', emoji: '🏨', label: 'Hotel / No Kitchen' },
+    { key: 'microwave', emoji: '📦', label: 'Microwave Only' },
+    { key: 'fridge', emoji: '❄️', label: 'Fridge Available' },
+    { key: 'airplane_food', emoji: '✈️', label: 'Crew Meals on Board' },
+  ];
+  const btnHtml = kitchenOptions.map(({ key, emoji, label }) =>
+    `<a href="/api/roster/confirm-kitchen?token=${token}&kitchen=${key}" style="display:block;margin:10px 0;padding:16px 24px;background:#152850;border:2px solid #1E3A6E;border-radius:12px;color:#F8FAFF;text-decoration:none;font-size:16px;font-weight:600;text-align:center;">${emoji} ${label}</a>`
+  ).join('');
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NutriCrew</title></head><body style="margin:0;padding:0;background:#07101E;font-family:system-ui,sans-serif;"><div style="max-width:520px;margin:0 auto;padding:32px 16px;"><div style="background:#0F2040;border-radius:20px;overflow:hidden;"><div style="background:linear-gradient(135deg,#0A1628,#152850);padding:28px 32px;text-align:center;border-bottom:1px solid #1E3A6E;"><div style="font-size:36px;">✈️</div><div style="color:#C9A84C;font-size:22px;font-weight:700;margin-top:8px;">NutriCrew</div><div style="color:#7A8EAA;font-size:13px;margin-top:4px;">Your pairing starts tomorrow</div></div><div style="padding:32px;"><p style="color:#F8FAFF;font-size:16px;font-weight:600;margin:0 0 16px;">What's your kitchen situation for <strong style="color:#E8C96A;">${dest}</strong>?</p>${btnHtml}<p style="color:#7A8EAA;font-size:13px;margin:24px 0 0;text-align:center;">Tap once — your personalised meal plan lands in your inbox within 30 seconds.</p></div></div></div></body></html>`);
 });
 
 // ── EXTRAS CACHE ──────────────────────────────────────────────────────────────
