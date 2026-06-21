@@ -13,6 +13,8 @@ const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
+const AI_API_BASE = process.env.AI_API_BASE || "https://nutricrew-backend.vercel.app";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://nutricrew-frontend.vercel.app";
 const FREE_PAIRING_LIMIT = 1;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
@@ -117,6 +119,28 @@ cachedExtrasSchema.index(
 );
 cachedExtrasSchema.index({ createdAt: 1 }, { expireAfterSeconds: 604800 }); // 7-day TTL
 const CachedExtras = mongoose.model('CachedExtras', cachedExtrasSchema);
+
+const scheduledPairingSchema = new mongoose.Schema({
+  email:            { type: String, index: true },
+  pairingDate:      { type: Date, index: true },
+  returnDate:       Date,
+  pairingDays:      Number,
+  departure:        String,
+  destinations:     [String],
+  goingUsa:         String,
+  timezone:         Number,
+  kitchen:          { type: String, default: "hotel" },
+  kitchenConfirmed: { type: Boolean, default: false },
+  confirmToken:     { type: String, unique: true, sparse: true },
+  reminderSentAt:   Date,
+  planEmailSentAt:  Date,
+  profile: {
+    name: String, gender: String, weight: String, dob: String,
+    position: String, diets: [String], goals: [String],
+    budgetAmount: String, budgetType: String, lang: String, lunchBag: String,
+  },
+}, { timestamps: true });
+const ScheduledPairing = mongoose.model('ScheduledPairing', scheduledPairingSchema);
 
 const mealSchema = new mongoose.Schema(
   {
@@ -511,6 +535,154 @@ app.post('/api/meal-cache/mark-seen', requireInternal, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── ROSTER ────────────────────────────────────────────────────────────────────
+
+// Store parsed pairings for a user (called from AI backend after roster parse)
+app.post('/api/roster/store', requireInternal, async (req, res) => {
+  try {
+    const { email, pairings, profile } = req.body;
+    if (!email || !Array.isArray(pairings) || pairings.length === 0) {
+      return res.status(400).json({ error: 'Missing email or pairings' });
+    }
+    // Upsert each pairing by email + pairingDate, generate fresh confirm token
+    const ops = pairings.map(p => ({
+      updateOne: {
+        filter: { email, pairingDate: new Date(p.pairingDate) },
+        update: {
+          $set: {
+            email,
+            pairingDate: new Date(p.pairingDate),
+            returnDate: p.returnDate ? new Date(p.returnDate) : null,
+            pairingDays: p.pairingDays,
+            departure: p.departure,
+            destinations: p.destinations,
+            goingUsa: p.goingUsa || 'no',
+            timezone: p.timezone || 0,
+            kitchenConfirmed: false,
+            reminderSentAt: null,
+            planEmailSentAt: null,
+            profile,
+            confirmToken: crypto.randomBytes(24).toString('hex'),
+          },
+        },
+        upsert: true,
+      },
+    }));
+    await ScheduledPairing.bulkWrite(ops);
+    res.json({ ok: true, stored: pairings.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Daily cron endpoint — find pairings starting tomorrow, send reminder emails via AI backend
+app.post('/api/roster/send-reminders', requireInternal, async (req, res) => {
+  try {
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const dayStart = new Date(tomorrow); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd   = new Date(tomorrow); dayEnd.setHours(23, 59, 59, 999);
+
+    const pairings = await ScheduledPairing.find({
+      pairingDate: { $gte: dayStart, $lte: dayEnd },
+      reminderSentAt: null,
+    }).lean();
+
+    let sent = 0;
+    for (const p of pairings) {
+      try {
+        const r = await fetch(`${AI_API_BASE}/api/roster/send-reminder`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-internal-key': INTERNAL_API_KEY },
+          body: JSON.stringify({
+            email: p.email,
+            name: p.profile?.name || p.email,
+            pairingDate: p.pairingDate,
+            destinations: p.destinations,
+            departure: p.departure,
+            pairingDays: p.pairingDays,
+            confirmToken: p.confirmToken,
+            lang: p.profile?.lang || 'en',
+          }),
+        });
+        if (r.ok) {
+          await ScheduledPairing.updateOne({ _id: p._id }, { $set: { reminderSentAt: new Date() } });
+          sent++;
+        }
+      } catch (e) { console.error('Reminder send failed for', p.email, e.message); }
+    }
+    res.json({ ok: true, sent, total: pairings.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Public — kitchen confirmation link clicked in email
+app.get('/api/roster/confirm-kitchen', async (req, res) => {
+  const { token, kitchen } = req.query;
+  const validKitchens = ['hotel', 'microwave', 'fridge', 'airplane_food'];
+  if (!token || !validKitchens.includes(kitchen)) {
+    return res.status(400).send('<h2>Invalid confirmation link.</h2>');
+  }
+  try {
+    const pairing = await ScheduledPairing.findOneAndUpdate(
+      { confirmToken: token },
+      { $set: { kitchen, kitchenConfirmed: true } },
+      { new: true }
+    );
+    if (!pairing) return res.status(404).send('<h2>Link expired or not found.</h2>');
+
+    // Trigger plan generation via AI backend (fire-and-forget)
+    const kitchenMap = { hotel: ['hotel'], microwave: ['microwave'], fridge: ['fridge'], airplane_food: ['airplane_food'] };
+    const payload = {
+      data: {
+        email: pairing.email,
+        name: pairing.profile?.name || '',
+        gender: pairing.profile?.gender || '',
+        weight: pairing.profile?.weight || '',
+        dob: pairing.profile?.dob || '',
+        position: pairing.profile?.position || 'cabin',
+        pairing_days: String(pairing.pairingDays || 1),
+        departure: pairing.departure,
+        destinations: pairing.destinations,
+        going_usa: pairing.goingUsa || 'no',
+        timezone: String(pairing.timezone || 0),
+        kitchen: kitchenMap[kitchen],
+        diets: pairing.profile?.diets || ['none'],
+        goals: pairing.profile?.goals || ['energy'],
+        budget_amount: pairing.profile?.budgetAmount || '30',
+        budget_type: pairing.profile?.budgetType || 'day',
+        lang: pairing.profile?.lang || 'en',
+        lunch_bag: pairing.profile?.lunchBag || null,
+      },
+      lang: pairing.profile?.lang || 'en',
+    };
+
+    fetch(`${AI_API_BASE}/api/generate-plan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(120000),
+    })
+      .then(async r => {
+        if (r.ok) {
+          await ScheduledPairing.updateOne({ _id: pairing._id }, { $set: { planEmailSentAt: new Date() } });
+        }
+      })
+      .catch(e => console.error('Plan generation failed for', pairing.email, e.message));
+
+    const kitchenLabels = { hotel: '🏨 Hotel', microwave: '📦 Microwave', fridge: '❄️ Fridge', airplane_food: '✈️ Crew Meals' };
+    const dest = pairing.destinations?.join(' → ') || 'your destination';
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NutriCrew</title><style>body{font-family:system-ui,sans-serif;background:#07101E;color:#F8FAFF;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:24px;box-sizing:border-box}.card{background:#0F2040;border-radius:20px;padding:40px 32px;max-width:400px;width:100%}.emoji{font-size:56px;margin-bottom:16px}.title{font-size:22px;font-weight:700;color:#C9A84C;margin-bottom:12px}.msg{color:#7A8EAA;font-size:15px;line-height:1.6}.badge{display:inline-block;background:#1E3A6E;color:#E8C96A;padding:6px 16px;border-radius:20px;font-size:14px;font-weight:600;margin:16px 0}.link{color:#4A9ECC;text-decoration:none;font-size:14px;margin-top:16px;display:block}</style></head><body><div class="card"><div class="emoji">✅</div><div class="title">Kitchen Confirmed!</div><div class="badge">${kitchenLabels[kitchen]}</div><div class="msg">Your meal plan for <strong>${dest}</strong> is being prepared.<br><br>📧 Check your email in about 30 seconds — your personalised NutriCrew plan is on its way!</div><a class="link" href="${FRONTEND_URL}">Open NutriCrew App</a></div></body></html>`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('<h2>Something went wrong. Please try again.</h2>');
   }
 });
 
