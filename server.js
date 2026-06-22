@@ -135,7 +135,7 @@ const scheduledPairingSchema = new mongoose.Schema({
   destinations:     [String],
   goingUsa:         String,
   timezone:         Number,
-  kitchen:          { type: String, default: "hotel" },
+  kitchen:          { type: [String], default: ["hotel"] },
   kitchenConfirmed: { type: Boolean, default: false },
   confirmToken:     { type: String, unique: true, sparse: true },
   reminderSentAt:   Date,
@@ -676,21 +676,21 @@ app.post('/api/roster/send-reminders', requireInternal, async (req, res) => {
 
 // Public — kitchen confirmation link clicked in email
 app.get('/api/roster/confirm-kitchen', async (req, res) => {
-  const { token, kitchen } = req.query;
+  const { token } = req.query;
   const validKitchens = ['hotel', 'microwave', 'fridge', 'airplane_food'];
-  if (!token || !validKitchens.includes(kitchen)) {
-    return res.status(400).send('<h2>Invalid confirmation link.</h2>');
-  }
+  const requested = Array.isArray(req.query.kitchen) ? req.query.kitchen : [req.query.kitchen];
+  const kitchens = [...new Set(requested.filter(k => validKitchens.includes(k)))];
+  if (!token) return res.status(400).send('<h2>Invalid confirmation link.</h2>');
+  if (kitchens.length === 0) return res.status(400).send('<h2>Please select at least one kitchen option.</h2>');
   try {
     const pairing = await ScheduledPairing.findOneAndUpdate(
       { confirmToken: token },
-      { $set: { kitchen, kitchenConfirmed: true } },
+      { $set: { kitchen: kitchens, kitchenConfirmed: true } },
       { new: true }
     );
     if (!pairing) return res.status(404).send('<h2>Link expired or not found.</h2>');
 
     // Trigger plan generation via AI backend (fire-and-forget)
-    const kitchenMap = { hotel: ['hotel'], microwave: ['microwave'], fridge: ['fridge'], airplane_food: ['airplane_food'] };
     const payload = {
       data: {
         email: pairing.email,
@@ -704,7 +704,7 @@ app.get('/api/roster/confirm-kitchen', async (req, res) => {
         destinations: pairing.destinations,
         going_usa: pairing.goingUsa || 'no',
         timezone: String(pairing.timezone || 0),
-        kitchen: kitchenMap[kitchen],
+        kitchen: kitchens,
         diets: pairing.profile?.diets || ['none'],
         goals: pairing.profile?.goals || ['energy'],
         budget_amount: pairing.profile?.budgetAmount || '30',
@@ -729,8 +729,9 @@ app.get('/api/roster/confirm-kitchen', async (req, res) => {
       .catch(e => console.error('Plan generation failed for', pairing.email, e.message));
 
     const kitchenLabels = { hotel: '🏨 Hotel', microwave: '📦 Microwave', fridge: '❄️ Fridge', airplane_food: '✈️ Crew Meals' };
+    const badgesHtml = kitchens.map(k => `<span class="badge">${kitchenLabels[k]}</span>`).join(' ');
     const dest = pairing.destinations?.join(' → ') || 'your destination';
-    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NutriCrew</title><style>body{font-family:system-ui,sans-serif;background:#07101E;color:#F8FAFF;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:24px;box-sizing:border-box}.card{background:#0F2040;border-radius:20px;padding:40px 32px;max-width:400px;width:100%}.emoji{font-size:56px;margin-bottom:16px}.title{font-size:22px;font-weight:700;color:#C9A84C;margin-bottom:12px}.msg{color:#7A8EAA;font-size:15px;line-height:1.6}.badge{display:inline-block;background:#1E3A6E;color:#E8C96A;padding:6px 16px;border-radius:20px;font-size:14px;font-weight:600;margin:16px 0}.link{color:#4A9ECC;text-decoration:none;font-size:14px;margin-top:16px;display:block}</style></head><body><div class="card"><div class="emoji">✅</div><div class="title">Kitchen Confirmed!</div><div class="badge">${kitchenLabels[kitchen]}</div><div class="msg">Your meal plan for <strong>${dest}</strong> is being prepared.<br><br>📧 Check your email in about 30 seconds — your personalised NutriCrew plan is on its way!</div><a class="link" href="${FRONTEND_URL}">Open NutriCrew App</a></div></body></html>`);
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NutriCrew</title><style>body{font-family:system-ui,sans-serif;background:#07101E;color:#F8FAFF;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:24px;box-sizing:border-box}.card{background:#0F2040;border-radius:20px;padding:40px 32px;max-width:400px;width:100%}.emoji{font-size:56px;margin-bottom:16px}.title{font-size:22px;font-weight:700;color:#C9A84C;margin-bottom:12px}.msg{color:#7A8EAA;font-size:15px;line-height:1.6}.badge{display:inline-block;background:#1E3A6E;color:#E8C96A;padding:6px 16px;border-radius:20px;font-size:14px;font-weight:600;margin:4px}.link{color:#4A9ECC;text-decoration:none;font-size:14px;margin-top:16px;display:block}</style></head><body><div class="card"><div class="emoji">✅</div><div class="title">Kitchen Confirmed!</div><div style="margin:16px 0;">${badgesHtml}</div><div class="msg">Your meal plan for <strong>${dest}</strong> is being prepared.<br><br>📧 Check your email in about 30 seconds — your personalised NutriCrew plan is on its way!</div><a class="link" href="${FRONTEND_URL}">Open NutriCrew App</a></div></body></html>`);
   } catch (err) {
     console.error(err);
     res.status(500).send('<h2>Something went wrong. Please try again.</h2>');
@@ -793,10 +794,13 @@ app.get('/api/roster/kitchen-select', async (req, res) => {
     { key: 'fridge', emoji: '❄️', label: 'Fridge Available' },
     { key: 'airplane_food', emoji: '✈️', label: 'Crew Meals on Board' },
   ];
-  const btnHtml = kitchenOptions.map(({ key, emoji, label }) =>
-    `<a href="/api/roster/confirm-kitchen?token=${token}&kitchen=${key}" style="display:block;margin:10px 0;padding:16px 24px;background:#152850;border:2px solid #1E3A6E;border-radius:12px;color:#F8FAFF;text-decoration:none;font-size:16px;font-weight:600;text-align:center;">${emoji} ${label}</a>`
+  const checkboxHtml = kitchenOptions.map(({ key, emoji, label }) =>
+    `<label style="display:flex;align-items:center;gap:12px;margin:10px 0;padding:16px 20px;background:#152850;border:2px solid #1E3A6E;border-radius:12px;color:#F8FAFF;font-size:16px;font-weight:600;cursor:pointer;">
+      <input type="checkbox" name="kitchen" value="${key}" style="width:20px;height:20px;accent-color:#C9A84C;flex-shrink:0;">
+      ${emoji} ${label}
+    </label>`
   ).join('');
-  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NutriCrew</title></head><body style="margin:0;padding:0;background:#07101E;font-family:system-ui,sans-serif;"><div style="max-width:520px;margin:0 auto;padding:32px 16px;"><div style="background:#0F2040;border-radius:20px;overflow:hidden;"><div style="background:linear-gradient(135deg,#0A1628,#152850);padding:28px 32px;text-align:center;border-bottom:1px solid #1E3A6E;"><div style="font-size:36px;">✈️</div><div style="color:#C9A84C;font-size:22px;font-weight:700;margin-top:8px;">NutriCrew</div><div style="color:#7A8EAA;font-size:13px;margin-top:4px;">Your pairing starts tomorrow</div></div><div style="padding:32px;"><p style="color:#F8FAFF;font-size:16px;font-weight:600;margin:0 0 16px;">What's your kitchen situation for <strong style="color:#E8C96A;">${dest}</strong>?</p>${btnHtml}<p style="color:#7A8EAA;font-size:13px;margin:24px 0 0;text-align:center;">Tap once — your personalised meal plan lands in your inbox within 30 seconds.</p></div></div></div></body></html>`);
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NutriCrew</title></head><body style="margin:0;padding:0;background:#07101E;font-family:system-ui,sans-serif;"><div style="max-width:520px;margin:0 auto;padding:32px 16px;"><div style="background:#0F2040;border-radius:20px;overflow:hidden;"><div style="background:linear-gradient(135deg,#0A1628,#152850);padding:28px 32px;text-align:center;border-bottom:1px solid #1E3A6E;"><div style="font-size:36px;">✈️</div><div style="color:#C9A84C;font-size:22px;font-weight:700;margin-top:8px;">NutriCrew</div><div style="color:#7A8EAA;font-size:13px;margin-top:4px;">Your pairing starts tomorrow</div></div><div style="padding:32px;"><p style="color:#F8FAFF;font-size:16px;font-weight:600;margin:0 0 16px;">What's your kitchen situation for <strong style="color:#E8C96A;">${dest}</strong>?</p><p style="color:#7A8EAA;font-size:13px;margin:0 0 16px;">Select all that apply.</p><form method="get" action="/api/roster/confirm-kitchen"><input type="hidden" name="token" value="${token}">${checkboxHtml}<button type="submit" style="display:block;width:100%;margin-top:20px;padding:16px 24px;background:#C9A84C;border:none;border-radius:12px;color:#07101E;font-size:16px;font-weight:700;cursor:pointer;">Confirm →</button></form><p style="color:#7A8EAA;font-size:13px;margin:24px 0 0;text-align:center;">Your personalised meal plan lands in your inbox within 30 seconds.</p></div></div></div></body></html>`);
 });
 
 // ── EXTRAS CACHE ──────────────────────────────────────────────────────────────
