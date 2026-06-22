@@ -162,6 +162,14 @@ const mealSchema = new mongoose.Schema(
 
 const Meal = mongoose.model('Meal', mealSchema);
 
+const gymPlanSchema = new mongoose.Schema({
+  email:   { type: String, index: true },
+  month:   { type: String, index: true }, // "YYYY-MM"
+  plan:    { type: mongoose.Schema.Types.Mixed },
+}, { timestamps: true });
+gymPlanSchema.index({ email: 1, month: 1 }, { unique: true });
+const GymPlan = mongoose.model('GymPlan', gymPlanSchema);
+
 const pushSubscriptionSchema = new mongoose.Schema({
   email: { type: String, index: true },
   subscription: { type: mongoose.Schema.Types.Mixed },
@@ -726,6 +734,32 @@ app.get('/api/roster/confirm-kitchen', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).send('<h2>Something went wrong. Please try again.</h2>');
+  }
+});
+
+// ── GYM PLAN ──────────────────────────────────────────────────────────────────
+
+app.post('/api/gym-plan/store', requireInternal, async (req, res) => {
+  const { email, month, plan } = req.body;
+  if (!email || !month || !plan) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    await GymPlan.findOneAndUpdate({ email, month }, { email, month, plan }, { upsert: true });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('gym-plan store error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/gym-plan/get', requireInternal, async (req, res) => {
+  const { email, month } = req.query;
+  if (!email || !month) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const doc = await GymPlan.findOne({ email, month }).lean();
+    res.json({ found: !!doc, plan: doc?.plan || null });
+  } catch (err) {
+    console.error('gym-plan get error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
