@@ -613,17 +613,17 @@ app.post('/api/roster/store', requireInternal, async (req, res) => {
   }
 });
 
-// Daily cron endpoint — find pairings starting tomorrow, send reminder emails via AI backend
+// Daily cron endpoint — find pairings departing within the next 30h, send reminder emails via AI backend
 app.post('/api/roster/send-reminders', requireInternal, async (req, res) => {
   try {
+    // Window is relative elapsed time, not a server-local calendar day —
+    // calendar-day math (setHours/setDate) depends on the process's TZ and
+    // can miss pairings whose UTC date differs from the server's "tomorrow".
     const now = new Date();
-    const tomorrow = new Date(now);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const dayStart = new Date(tomorrow); dayStart.setHours(0, 0, 0, 0);
-    const dayEnd   = new Date(tomorrow); dayEnd.setHours(23, 59, 59, 999);
+    const windowEnd = new Date(now.getTime() + 30 * 60 * 60 * 1000); // next 30h
 
     const pairings = await ScheduledPairing.find({
-      pairingDate: { $gte: dayStart, $lte: dayEnd },
+      pairingDate: { $gte: now, $lte: windowEnd },
       reminderSentAt: null,
     }).lean();
 
