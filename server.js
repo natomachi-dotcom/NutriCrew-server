@@ -77,6 +77,8 @@ const userSchema = new mongoose.Schema(
     password: { type: String, required: true },
     pairingCount: { type: Number, default: 0 },
     isPremium: { type: Boolean, default: false },
+    stripeCustomerId: { type: String, default: null, index: true },
+    stripeSubscriptionId: { type: String, default: null },
     emailVerified: { type: Boolean, default: false },
     registeredIP: { type: String, default: null },
     otpHash: { type: String, default: null },
@@ -320,16 +322,40 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
 
 app.post('/api/set-premium', requireInternal, async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, stripeCustomerId, stripeSubscriptionId } = req.body;
     if (!email || typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
       return res.status(400).json({ error: 'Missing or invalid email' });
     }
+    const update = { isPremium: true };
+    if (stripeCustomerId) update.stripeCustomerId = stripeCustomerId;
+    if (stripeSubscriptionId) update.stripeSubscriptionId = stripeSubscriptionId;
     const user = await User.findOneAndUpdate(
       { email: email.toLowerCase().trim() },
-      { isPremium: true },
+      update,
       { new: true }
     );
     if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ isPremium: user.isPremium });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Called by the Stripe webhook for subscription lifecycle events, which only
+// carry a Stripe customer ID (not necessarily the account email).
+app.post('/api/set-premium-by-customer', requireInternal, async (req, res) => {
+  try {
+    const { stripeCustomerId, isPremium } = req.body;
+    if (!stripeCustomerId || typeof isPremium !== 'boolean') {
+      return res.status(400).json({ error: 'Missing or invalid stripeCustomerId/isPremium' });
+    }
+    const user = await User.findOneAndUpdate(
+      { stripeCustomerId },
+      { isPremium },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ error: 'User not found for this Stripe customer' });
     res.json({ isPremium: user.isPremium });
   } catch (err) {
     console.error(err);
