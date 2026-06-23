@@ -84,6 +84,10 @@ const userSchema = new mongoose.Schema(
     otpHash: { type: String, default: null },
     otpExpiry: { type: Date, default: null },
     otpAttempts: { type: Number, default: 0 },
+    // Null until the user explicitly sets a password (OTP-created accounts
+    // start with a random placeholder hash in `password` that can't be logged in with).
+    passwordSetAt: { type: Date, default: null },
+    passwordAttempts: { type: Number, default: 0 },
     sessionToken: { type: String, default: null },
     sessionExpiry: { type: Date, default: null },
     seenDayIds: [{ type: mongoose.Schema.Types.ObjectId }],
@@ -375,6 +379,14 @@ app.post('/api/set-premium-by-customer', requireInternal, async (req, res) => {
 });
 
 // Internal auth endpoints called by nutricrew-backend
+const passwordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again later.' },
+});
+
 const otpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 5,
@@ -407,7 +419,7 @@ app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) =>
     if (user.emailVerified) {
       const sessionToken = crypto.randomBytes(32).toString('hex');
       await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null });
-      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount });
+      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, hasPassword: !!user.passwordSetAt });
     }
 
     const expiry = new Date(Date.now() + 10 * 60 * 1000);
@@ -449,7 +461,56 @@ app.post('/api/auth/check-otp', requireInternal, async (req, res) => {
     };
     if (clientIP && !user.registeredIP) updates.registeredIP = clientIP;
     await User.updateOne({ email: normalizedEmail }, updates);
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, hasPassword: !!user.passwordSetAt });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/check-password', requireInternal, passwordLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user || !user.passwordSetAt) {
+      return res.status(400).json({ error: 'no_password' });
+    }
+    if (user.passwordAttempts >= 5) {
+      return res.status(429).json({ error: 'Too many attempts. Please use email code login instead.' });
+    }
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      await User.updateOne({ email: normalizedEmail }, { $inc: { passwordAttempts: 1 } });
+      return res.status(401).json({ error: 'Incorrect password.' });
+    }
+    const sessionToken = crypto.randomBytes(32).toString('hex');
+    await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null, passwordAttempts: 0 });
     res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Requires a valid existing session token (the proof of identity), so this
+// covers both "set my first password after OTP login" and "change password" later.
+app.post('/api/auth/set-password', requireInternal, async (req, res) => {
+  try {
+    const { email, password, token } = req.body;
+    if (!email || !password || !token) return res.status(400).json({ error: 'email, password and token are required' });
+    if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
+    }
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user || !user.sessionToken || user.sessionToken !== token) {
+      return res.status(401).json({ error: 'Invalid session. Please log in again.' });
+    }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await User.updateOne({ email: normalizedEmail }, { password: hashedPassword, passwordSetAt: new Date() });
+    res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
