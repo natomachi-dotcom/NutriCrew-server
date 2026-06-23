@@ -128,6 +128,14 @@ cachedExtrasSchema.index(
 cachedExtrasSchema.index({ createdAt: 1 }, { expireAfterSeconds: 604800 }); // 7-day TTL
 const CachedExtras = mongoose.model('CachedExtras', cachedExtrasSchema);
 
+const placesCacheSchema = new mongoose.Schema({
+  cityKey:     { type: String, unique: true },
+  groceries:   mongoose.Schema.Types.Mixed,
+  restaurants: mongoose.Schema.Types.Mixed,
+}, { timestamps: true });
+placesCacheSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86400 }); // 24h TTL — open_now can go stale
+const PlacesCache = mongoose.model('PlacesCache', placesCacheSchema);
+
 const scheduledPairingSchema = new mongoose.Schema({
   email:            { type: String, index: true },
   pairingDate:      { type: Date, index: true },
@@ -906,6 +914,34 @@ app.post('/api/extras-cache/store', requireInternal, async (req, res) => {
     await CachedExtras.findOneAndUpdate(
       { dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang, destinationKey, goingUsa, pairingDays },
       { $set: { summary, groceryList, foodRestrictions, createdAt: new Date() } },
+      { upsert: true, new: true }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── PLACES CACHE ───────────────────────────────────────────────────────────────
+
+app.post('/api/places-cache/query', requireInternal, async (req, res) => {
+  try {
+    const { cityKey } = req.body;
+    const doc = await PlacesCache.findOne({ cityKey }).lean();
+    res.json({ hit: !!doc, groceries: doc?.groceries ?? null, restaurants: doc?.restaurants ?? null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/places-cache/store', requireInternal, async (req, res) => {
+  try {
+    const { cityKey, groceries, restaurants } = req.body;
+    await PlacesCache.findOneAndUpdate(
+      { cityKey },
+      { $set: { groceries, restaurants, createdAt: new Date() } },
       { upsert: true, new: true }
     );
     res.json({ ok: true });
