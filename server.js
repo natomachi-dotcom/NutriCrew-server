@@ -99,12 +99,13 @@ const cachedDaySchema = new mongoose.Schema({
   budgetLevel:      String,
   kitchenKey:       String,
   calorieTargetKey: String,
+  cookingKey:       String,
   lang:             String,
   meals:            [mongoose.Schema.Types.Mixed],
   totalCalories:    Number,
   useCount:         { type: Number, default: 0 },
 }, { timestamps: true });
-cachedDaySchema.index({ dietKey: 1, goalKey: 1, budgetLevel: 1, kitchenKey: 1, calorieTargetKey: 1, lang: 1 });
+cachedDaySchema.index({ dietKey: 1, goalKey: 1, budgetLevel: 1, kitchenKey: 1, calorieTargetKey: 1, cookingKey: 1, lang: 1 });
 const CachedDay = mongoose.model('CachedDay', cachedDaySchema);
 
 const cachedExtrasSchema = new mongoose.Schema({
@@ -562,14 +563,14 @@ app.delete('/api/meals/:id', requireAdmin, async (req, res) => {
 // Query unseen cached days for a user matching their profile key
 app.post('/api/meal-cache/query', requireInternal, async (req, res) => {
   try {
-    const { email, dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang, count } = req.body;
+    const { email, dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, cookingKey, lang, count } = req.body;
     const user = await User.findOne({ email }).select('seenDayIds').lean();
     const seenIds = user?.seenDayIds || [];
     const days = await CachedDay.find({
-      dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang,
+      dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, cookingKey, lang,
       _id: { $nin: seenIds },
     }).limit(count || 7).lean();
-    const total = await CachedDay.countDocuments({ dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang });
+    const total = await CachedDay.countDocuments({ dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, cookingKey, lang });
     res.json({ days, total });
   } catch (err) {
     console.error(err);
@@ -580,10 +581,10 @@ app.post('/api/meal-cache/query', requireInternal, async (req, res) => {
 // Store newly generated days into cache
 app.post('/api/meal-cache/store', requireInternal, async (req, res) => {
   try {
-    const { days, dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang } = req.body;
+    const { days, dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, cookingKey, lang } = req.body;
     if (!Array.isArray(days) || days.length === 0) return res.json({ stored: 0, ids: [] });
     const docs = await CachedDay.insertMany(
-      days.map(d => ({ meals: d.meals, totalCalories: d.totalCalories, dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, lang }))
+      days.map(d => ({ meals: d.meals, totalCalories: d.totalCalories, dietKey, goalKey, budgetLevel, kitchenKey, calorieTargetKey, cookingKey, lang }))
     );
     res.json({ stored: docs.length, ids: docs.map(d => String(d._id)) });
   } catch (err) {
