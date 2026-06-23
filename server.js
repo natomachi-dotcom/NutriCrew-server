@@ -739,6 +739,7 @@ app.get('/api/roster/confirm-kitchen', async (req, res) => {
         budget_type: pairing.profile?.budgetType || 'day',
         lang: pairing.profile?.lang || 'en',
         lunch_bag: pairing.profile?.lunchBag || null,
+        source: 'roster',
       },
       lang: pairing.profile?.lang || 'en',
     };
@@ -760,7 +761,7 @@ app.get('/api/roster/confirm-kitchen', async (req, res) => {
           sendPushToEmail(pairing.email, {
             title: `🍽️ Your ${dest} meal plan is ready!`,
             body: 'Tap to open the app and view your personalized plan.',
-            data: { url: FRONTEND_URL },
+            data: { url: `${FRONTEND_URL}?plan=1` },
           }).catch(e => console.error('Plan-ready push failed for', pairing.email, e.message));
         }
       })
@@ -769,7 +770,7 @@ app.get('/api/roster/confirm-kitchen', async (req, res) => {
     const kitchenLabels = { hotel: '🏨 Hotel', microwave: '📦 Microwave', fridge: '❄️ Fridge', airplane_food: '✈️ Crew Meals' };
     const badgesHtml = kitchens.map(k => `<span class="badge">${kitchenLabels[k]}</span>`).join(' ');
     const dest = pairing.destinations?.join(' → ') || 'your destination';
-    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NutriCrew</title><style>body{font-family:system-ui,sans-serif;background:#07101E;color:#F8FAFF;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:24px;box-sizing:border-box}.card{background:#0F2040;border-radius:20px;padding:40px 32px;max-width:400px;width:100%}.emoji{font-size:56px;margin-bottom:16px}.title{font-size:22px;font-weight:700;color:#C9A84C;margin-bottom:12px}.msg{color:#7A8EAA;font-size:15px;line-height:1.6}.badge{display:inline-block;background:#1E3A6E;color:#E8C96A;padding:6px 16px;border-radius:20px;font-size:14px;font-weight:600;margin:4px}.link{color:#07101E;text-decoration:none;font-size:15px;font-weight:700;margin-top:20px;display:block;background:#C9A84C;padding:14px 24px;border-radius:12px;}</style></head><body><div class="card"><div class="emoji">✅</div><div class="title">Kitchen Confirmed!</div><div style="margin:16px 0;">${badgesHtml}</div><div class="msg">Your meal plan for <strong>${dest}</strong> is being prepared.<br><br>🍽️ It'll be ready in about 30 seconds — open the app to view it.</div><a class="link" href="${FRONTEND_URL}">Open NutriCrew App →</a></div></body></html>`);
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NutriCrew</title><style>body{font-family:system-ui,sans-serif;background:#07101E;color:#F8FAFF;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:24px;box-sizing:border-box}.card{background:#0F2040;border-radius:20px;padding:40px 32px;max-width:400px;width:100%}.emoji{font-size:56px;margin-bottom:16px}.title{font-size:22px;font-weight:700;color:#C9A84C;margin-bottom:12px}.msg{color:#7A8EAA;font-size:15px;line-height:1.6}.badge{display:inline-block;background:#1E3A6E;color:#E8C96A;padding:6px 16px;border-radius:20px;font-size:14px;font-weight:600;margin:4px}.link{color:#07101E;text-decoration:none;font-size:15px;font-weight:700;margin-top:20px;display:block;background:#C9A84C;padding:14px 24px;border-radius:12px;}</style></head><body><div class="card"><div class="emoji">✅</div><div class="title">Kitchen Confirmed!</div><div style="margin:16px 0;">${badgesHtml}</div><div class="msg">Your meal plan for <strong>${dest}</strong> is being prepared.<br><br>🍽️ It'll be ready in about 30 seconds — open the app to view it.</div><a class="link" href="${FRONTEND_URL}?plan=1">Open NutriCrew App →</a></div></body></html>`);
   } catch (err) {
     console.error(err);
     res.status(500).send('<h2>Something went wrong. Please try again.</h2>');
