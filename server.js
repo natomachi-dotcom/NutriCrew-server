@@ -401,14 +401,6 @@ app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) =>
     if (!email || !otpHash) return res.status(400).json({ error: 'email and otpHash are required' });
     const normalizedEmail = email.toLowerCase().trim();
 
-    // Block if another verified account is already registered from this IP.
-    if (clientIP) {
-      const ipOwner = await User.findOne({ registeredIP: clientIP, emailVerified: true });
-      if (ipOwner && ipOwner.email !== normalizedEmail) {
-        return res.status(403).json({ error: 'An account is already linked to this device. Please use that email to sign in.' });
-      }
-    }
-
     let user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       const ph = await bcrypt.hash(crypto.randomUUID(), 10);
