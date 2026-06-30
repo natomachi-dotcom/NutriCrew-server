@@ -802,6 +802,7 @@ app.get('/api/roster/confirm-kitchen', async (req, res) => {
         lang: pairing.profile?.lang || 'en',
         lunch_bag: pairing.profile?.lunchBag || null,
         source: 'roster',
+        confirm_token: pairing.confirmToken,
       },
       lang: pairing.profile?.lang || 'en',
     };
@@ -879,6 +880,143 @@ app.post('/api/roster/mark-plan-viewed', requireInternal, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── PRINT PLAN ────────────────────────────────────────────────────────────────
+
+app.get('/print-plan', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('<h2>Missing token</h2>');
+  try {
+    const pairing = await ScheduledPairing.findOne({ confirmToken: token }).lean();
+    if (!pairing || !pairing.plan) return res.status(404).send('<h2>Plan not found. It may not be ready yet — try again in a moment.</h2>');
+
+    const plan = pairing.plan;
+    const dest = (pairing.destinations || []).join(' → ') || 'your destination';
+    const depDate = pairing.pairingDate ? new Date(pairing.pairingDate).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : '';
+    const mealIcons = { Breakfast: '🌅', Lunch: '☀️', Dinner: '🌙', Snack: '🍎' };
+
+    const daysHtml = (plan.days || []).map(d => {
+      const mealsHtml = (d.meals || []).map(m => `
+        <div class="meal">
+          <div class="meal-header">
+            <span class="meal-type">${mealIcons[m.type] || '🍽️'} ${m.type}</span>
+            <span class="meal-cals">${m.calories} kcal · P:${m.protein}g C:${m.carbs}g F:${m.fat}g</span>
+          </div>
+          <div class="meal-name">${m.emoji || ''} ${m.name}</div>
+          <div class="meal-desc">${m.description || ''}</div>
+          ${m.prep ? `<div class="meal-prep"><strong>Prep:</strong> ${m.prep}</div>` : ''}
+          ${m.tip ? `<div class="meal-tip">💡 ${m.tip}</div>` : ''}
+          ${m.container ? `<div class="meal-container">📦 ${m.container}</div>` : ''}
+        </div>`).join('');
+      return `
+        <div class="day">
+          <div class="day-header">
+            <span class="day-label">${d.label || `Day ${d.day}`}</span>
+            <span class="day-cals">${d.totalCalories || ''} kcal total</span>
+          </div>
+          ${d.jetlagNote ? `<div class="jetlag-note">✈️ ${d.jetlagNote}</div>` : ''}
+          ${mealsHtml}
+        </div>`;
+    }).join('');
+
+    const groceryHtml = plan.groceryList
+      ? Object.entries(plan.groceryList).map(([cat, items]) =>
+          Array.isArray(items) && items.length
+            ? `<div class="grocery-cat"><strong>${cat}</strong><ul>${items.map(i => `<li>${i}</li>`).join('')}</ul></div>`
+            : ''
+        ).join('')
+      : '';
+
+    const restrictionsHtml = (plan.foodRestrictions || []).map(r => `<li>${r}</li>`).join('');
+
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NutriCrew Meal Plan – ${dest}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 13px; color: #111; background: #fff; padding: 24px; max-width: 800px; margin: 0 auto; }
+  .print-header { text-align: center; border-bottom: 3px solid #C9A84C; padding-bottom: 16px; margin-bottom: 20px; }
+  .brand { font-size: 22px; font-weight: 900; color: #0A1628; letter-spacing: 3px; }
+  .trip-info { font-size: 15px; color: #333; margin-top: 6px; }
+  .date-info { font-size: 12px; color: #666; margin-top: 4px; }
+  .summary { background: #f8f4e8; border-left: 4px solid #C9A84C; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; line-height: 1.6; }
+  .section-title { font-size: 16px; font-weight: 700; color: #0A1628; border-bottom: 2px solid #eee; padding-bottom: 6px; margin: 20px 0 12px; text-transform: uppercase; letter-spacing: 1px; }
+  .day { border: 1px solid #ddd; border-radius: 8px; margin-bottom: 16px; overflow: hidden; page-break-inside: avoid; }
+  .day-header { background: #0A1628; color: #fff; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center; }
+  .day-label { font-weight: 700; font-size: 14px; }
+  .day-cals { font-size: 12px; color: #C9A84C; font-weight: 600; }
+  .jetlag-note { background: #e8f4f8; padding: 8px 14px; font-size: 12px; color: #0066aa; border-bottom: 1px solid #ddd; }
+  .meal { padding: 10px 14px; border-bottom: 1px solid #f0f0f0; }
+  .meal:last-child { border-bottom: none; }
+  .meal-header { display: flex; justify-content: space-between; margin-bottom: 4px; }
+  .meal-type { font-size: 11px; font-weight: 700; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+  .meal-cals { font-size: 11px; color: #888; }
+  .meal-name { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+  .meal-desc { font-size: 12px; color: #444; margin-bottom: 4px; line-height: 1.5; }
+  .meal-prep { font-size: 12px; color: #333; margin-bottom: 4px; line-height: 1.5; }
+  .meal-tip { font-size: 11px; color: #666; margin-top: 4px; font-style: italic; }
+  .meal-container { font-size: 11px; color: #888; margin-top: 3px; }
+  .grocery-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .grocery-cat strong { display: block; font-size: 12px; text-transform: uppercase; color: #0A1628; margin-bottom: 4px; letter-spacing: 0.5px; }
+  .grocery-cat ul { list-style: disc; padding-left: 16px; }
+  .grocery-cat li { font-size: 12px; line-height: 1.8; }
+  .restrictions ul { padding-left: 16px; }
+  .restrictions li { font-size: 12px; line-height: 1.8; color: #c00; }
+  .print-btn { display: block; margin: 0 auto 20px; background: #C9A84C; color: #07101E; border: none; border-radius: 10px; padding: 12px 32px; font-size: 15px; font-weight: 700; cursor: pointer; }
+  .footer { text-align: center; font-size: 11px; color: #999; margin-top: 24px; padding-top: 12px; border-top: 1px solid #eee; }
+  @media print {
+    .print-btn { display: none !important; }
+    body { padding: 8px; }
+    .day { page-break-inside: avoid; }
+    .grocery-grid { grid-template-columns: repeat(3, 1fr); }
+  }
+</style>
+</head>
+<body>
+<button class="print-btn no-print" onclick="window.print()">🖨️ Print Meal Plan</button>
+
+<div class="print-header">
+  <div class="brand">✈ NUTRICREW</div>
+  <div class="trip-info">Meal Plan · ${dest}</div>
+  ${depDate ? `<div class="date-info">Departure: ${depDate} · ${pairing.pairingDays || ''} days</div>` : ''}
+  <div class="date-info" style="margin-top:4px;color:#999;">Generated by NutriCrew AI · for informational purposes only</div>
+</div>
+
+${plan.summary ? `<div class="summary">${plan.summary}</div>` : ''}
+
+<div class="section-title">📅 Daily Meal Plan</div>
+${daysHtml}
+
+${groceryHtml ? `
+<div class="section-title">🛒 Grocery List</div>
+<div class="grocery-grid">${groceryHtml}</div>
+` : ''}
+
+${restrictionsHtml ? `
+<div class="restrictions">
+<div class="section-title">⚠️ Food Rules</div>
+<ul>${restrictionsHtml}</ul>
+</div>
+` : ''}
+
+<div class="footer">
+  NutriCrew · Fuel Your Flight · Generated by AI · Consult a healthcare professional before making significant dietary changes.
+</div>
+
+<script>
+  // Auto-print when opened from email — comment out if you prefer manual
+  // window.onload = () => window.print();
+</script>
+</body>
+</html>`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('<h2>Something went wrong. Please try again.</h2>');
   }
 });
 
