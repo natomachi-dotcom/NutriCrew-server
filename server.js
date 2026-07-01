@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const express = require('express');
+const compression = require('compression');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -26,12 +27,17 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
 
 app.set('trust proxy', 1);
+app.use(compression());
 // contentSecurityPolicy/CORP are tuned off/loosened: this is a JSON API with
 // no HTML to protect, and tightening CORP breaks cross-origin fetch() from
 // the frontend's different Vercel origin.
 app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors());
 app.use(express.json());
+
+// Keep-warm endpoint — UptimeRobot / cron-job.org pings this every 5 min
+// to prevent Render free-tier cold starts. No auth, no DB, responds instantly.
+app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // Baseline abuse protection on every API route, per IP.
 const apiLimiter = rateLimit({
