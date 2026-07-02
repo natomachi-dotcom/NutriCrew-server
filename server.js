@@ -97,6 +97,9 @@ const userSchema = new mongoose.Schema(
     sessionToken: { type: String, default: null },
     sessionExpiry: { type: Date, default: null },
     seenDayIds: [{ type: mongoose.Schema.Types.ObjectId }],
+    referralCode: { type: String, default: null, unique: true, sparse: true },
+    bonusPairings: { type: Number, default: 0 },
+    referredBy: { type: String, default: null },
   },
   { timestamps: true }
 );
@@ -333,8 +336,8 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
       }
     }
 
-    const allowed = user.isPremium || user.pairingCount < FREE_PAIRING_LIMIT;
-    res.json({ allowed, pairingCount: user.pairingCount, isPremium: user.isPremium });
+    const allowed = user.isPremium || user.pairingCount < FREE_PAIRING_LIMIT + (user.bonusPairings || 0);
+    res.json({ allowed, pairingCount: user.pairingCount, isPremium: user.isPremium, bonusPairings: user.bonusPairings || 0 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -417,7 +420,7 @@ app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) =>
     if (user.emailVerified) {
       const sessionToken = crypto.randomBytes(32).toString('hex');
       await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null });
-      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, hasPassword: !!user.passwordSetAt });
+      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
     }
 
     const expiry = new Date(Date.now() + 10 * 60 * 1000);
@@ -459,7 +462,7 @@ app.post('/api/auth/check-otp', requireInternal, async (req, res) => {
     };
     if (clientIP && !user.registeredIP) updates.registeredIP = clientIP;
     await User.updateOne({ email: normalizedEmail }, updates);
-    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, hasPassword: !!user.passwordSetAt });
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -485,7 +488,7 @@ app.post('/api/auth/check-password', requireInternal, passwordLimiter, async (re
     }
     const sessionToken = crypto.randomBytes(32).toString('hex');
     await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null, passwordAttempts: 0 });
-    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount });
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -526,7 +529,7 @@ app.post('/api/auth/check-session', requireInternal, async (req, res) => {
     if (user.sessionExpiry && new Date() > user.sessionExpiry) {
       return res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
-    res.json({ email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount });
+    res.json({ email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -550,6 +553,65 @@ app.post('/api/pairing-usage/increment', requireInternal, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     res.json({ pairingCount: user.pairingCount, isPremium: user.isPremium });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Referral system
+app.get('/api/referral/code', requireInternal, async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email || typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: 'Valid email is required' });
+    }
+    const normalizedEmail = email.toLowerCase().trim();
+    let user = await User.findOne({ email: normalizedEmail });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (!user.referralCode) {
+      // Generate unique 8-char uppercase hex code
+      let code;
+      let attempts = 0;
+      do {
+        code = crypto.randomBytes(4).toString('hex').toUpperCase();
+        attempts++;
+        if (attempts > 10) return res.status(500).json({ error: 'Could not generate unique code' });
+      } while (await User.exists({ referralCode: code }));
+      await User.updateOne({ email: normalizedEmail }, { referralCode: code });
+      user.referralCode = code;
+    }
+
+    res.json({ referralCode: user.referralCode, bonusPairings: user.bonusPairings || 0 });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Called when a new user signs up with a referral code — credits both parties
+app.post('/api/referral/use', requireInternal, async (req, res) => {
+  try {
+    const { email, referralCode } = req.body;
+    if (!email || !referralCode) return res.status(400).json({ error: 'email and referralCode are required' });
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const newUser = await User.findOne({ email: normalizedEmail });
+    if (!newUser) return res.status(404).json({ error: 'User not found' });
+    if (newUser.referredBy) return res.json({ alreadyApplied: true });
+
+    const referrer = await User.findOne({ referralCode: referralCode.toUpperCase() });
+    if (!referrer) return res.status(404).json({ error: 'Invalid referral code' });
+    if (referrer.email === normalizedEmail) return res.status(400).json({ error: 'Cannot use your own referral code' });
+
+    // Credit +1 bonus pairing to both referrer and new user
+    await Promise.all([
+      User.updateOne({ email: normalizedEmail }, { referredBy: referralCode.toUpperCase(), $inc: { bonusPairings: 1 } }),
+      User.updateOne({ referralCode: referralCode.toUpperCase() }, { $inc: { bonusPairings: 1 } }),
+    ]);
+
+    res.json({ success: true, referrerName: referrer.name });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
