@@ -97,7 +97,7 @@ const userSchema = new mongoose.Schema(
     sessionToken: { type: String, default: null },
     sessionExpiry: { type: Date, default: null },
     seenDayIds: [{ type: mongoose.Schema.Types.ObjectId }],
-    referralCode: { type: String, default: null, unique: true, sparse: true },
+    referralCode: { type: String, default: undefined, unique: true, sparse: true },
     bonusPairings: { type: Number, default: 0 },
     referredBy: { type: String, default: null },
   },
