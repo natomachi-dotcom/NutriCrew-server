@@ -20,6 +20,12 @@ const FRONTEND_URL = process.env.FRONTEND_URL || "https://nutricrew-frontend.ver
 const CRUD_SELF_URL = process.env.CRUD_SELF_URL || "https://nutricrew-server-1.onrender.com";
 const FREE_PAIRING_LIMIT = 1;
 
+// "YYYY-MM" key for the current calendar month — the free tier renews on this boundary.
+function currentMonthKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
   webpush.setVapidDetails('mailto:renatogadeabi@gmail.com', process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
 }
@@ -82,6 +88,9 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true },
     pairingCount: { type: Number, default: 0 },
+    // "YYYY-MM" for the month pairingCount currently applies to — lets the free
+    // tier renew monthly instead of being a lifetime limit.
+    pairingCountMonth: { type: String, default: null },
     isPremium: { type: Boolean, default: false },
     stripeCustomerId: { type: String, default: null, index: true },
     stripeSubscriptionId: { type: String, default: null },
@@ -319,11 +328,16 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
     }
 
     const normalizedEmail = email.toLowerCase().trim();
+    const nowMonth = currentMonthKey();
 
     let user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       const placeholderPassword = await bcrypt.hash(crypto.randomUUID(), 10);
-      user = await User.create({ name: name || normalizedEmail, email: normalizedEmail, password: placeholderPassword });
+      user = await User.create({ name: name || normalizedEmail, email: normalizedEmail, password: placeholderPassword, pairingCountMonth: nowMonth });
+    } else if (user.pairingCountMonth !== nowMonth) {
+      user.pairingCount = 0;
+      user.pairingCountMonth = nowMonth;
+      await user.save();
     }
 
     const allowed = user.isPremium || user.pairingCount < FREE_PAIRING_LIMIT + (user.bonusPairings || 0);
@@ -535,12 +549,21 @@ app.post('/api/pairing-usage/increment', requireInternal, async (req, res) => {
     }
 
     const normalizedEmail = email.toLowerCase().trim();
-    const user = await User.findOneAndUpdate(
-      { email: normalizedEmail },
-      { $inc: { pairingCount: 1 } },
-      { new: true }
-    );
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    const nowMonth = currentMonthKey();
+    const existing = await User.findOne({ email: normalizedEmail });
+    if (!existing) return res.status(404).json({ error: 'User not found' });
+
+    const user = existing.pairingCountMonth !== nowMonth
+      ? await User.findOneAndUpdate(
+          { email: normalizedEmail },
+          { $set: { pairingCount: 1, pairingCountMonth: nowMonth } },
+          { new: true }
+        )
+      : await User.findOneAndUpdate(
+          { email: normalizedEmail },
+          { $inc: { pairingCount: 1 } },
+          { new: true }
+        );
 
     res.json({ pairingCount: user.pairingCount, isPremium: user.isPremium });
   } catch (err) {
