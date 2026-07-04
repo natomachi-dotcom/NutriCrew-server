@@ -319,21 +319,11 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
     }
 
     const normalizedEmail = email.toLowerCase().trim();
-    const { clientIP } = req.body;
 
     let user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       const placeholderPassword = await bcrypt.hash(crypto.randomUUID(), 10);
       user = await User.create({ name: name || normalizedEmail, email: normalizedEmail, password: placeholderPassword });
-    }
-
-    // IP enforcement: if this IP already has a DIFFERENT user who hit the limit,
-    // apply that user's count to the requesting email too.
-    if (clientIP && !user.isPremium) {
-      const ipOwner = await User.findOne({ registeredIP: clientIP, emailVerified: true });
-      if (ipOwner && ipOwner.email !== normalizedEmail && !ipOwner.isPremium && ipOwner.pairingCount >= FREE_PAIRING_LIMIT) {
-        return res.json({ allowed: false, pairingCount: ipOwner.pairingCount, isPremium: false, ipBlocked: true });
-      }
     }
 
     const allowed = user.isPremium || user.pairingCount < FREE_PAIRING_LIMIT + (user.bonusPairings || 0);
