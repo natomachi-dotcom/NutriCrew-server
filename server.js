@@ -343,7 +343,7 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
     }
 
     const allowed = user.isPremium || user.pairingCount < FREE_PAIRING_LIMIT + (user.bonusPairings || 0);
-    res.json({ allowed, pairingCount: user.pairingCount, isPremium: user.isPremium, bonusPairings: user.bonusPairings || 0 });
+    res.json({ allowed, pairingCount: user.pairingCount, isPremium: user.isPremium, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
