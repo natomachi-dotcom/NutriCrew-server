@@ -94,6 +94,8 @@ const userSchema = new mongoose.Schema(
     isPremium: { type: Boolean, default: false },
     stripeCustomerId: { type: String, default: null, index: true },
     stripeSubscriptionId: { type: String, default: null },
+    // Null once the trial has converted or if the user never started one.
+    trialEnd: { type: Date, default: null },
     emailVerified: { type: Boolean, default: false },
     registeredIP: { type: String, default: null },
     otpHash: { type: String, default: null },
@@ -350,20 +352,21 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
 
 app.post('/api/set-premium', requireInternal, async (req, res) => {
   try {
-    const { email, stripeCustomerId, stripeSubscriptionId } = req.body;
+    const { email, stripeCustomerId, stripeSubscriptionId, trialEnd } = req.body;
     if (!email || typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
       return res.status(400).json({ error: 'Missing or invalid email' });
     }
     const update = { isPremium: true };
     if (stripeCustomerId) update.stripeCustomerId = stripeCustomerId;
     if (stripeSubscriptionId) update.stripeSubscriptionId = stripeSubscriptionId;
+    if (trialEnd !== undefined) update.trialEnd = trialEnd === null ? null : new Date(trialEnd * 1000);
     const user = await User.findOneAndUpdate(
       { email: email.toLowerCase().trim() },
       update,
       { new: true }
     );
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ isPremium: user.isPremium });
+    res.json({ isPremium: user.isPremium, trialEnd: user.trialEnd });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -374,17 +377,42 @@ app.post('/api/set-premium', requireInternal, async (req, res) => {
 // carry a Stripe customer ID (not necessarily the account email).
 app.post('/api/set-premium-by-customer', requireInternal, async (req, res) => {
   try {
-    const { stripeCustomerId, isPremium } = req.body;
+    const { stripeCustomerId, isPremium, trialEnd } = req.body;
     if (!stripeCustomerId || typeof isPremium !== 'boolean') {
       return res.status(400).json({ error: 'Missing or invalid stripeCustomerId/isPremium' });
     }
+    const update = { isPremium };
+    // trialEnd is only ever passed as a unix seconds timestamp (from a Stripe
+    // subscription object) or explicitly null to clear it once converted/cancelled.
+    if (trialEnd !== undefined) {
+      update.trialEnd = trialEnd === null ? null : new Date(trialEnd * 1000);
+    }
     const user = await User.findOneAndUpdate(
       { stripeCustomerId },
-      { isPremium },
+      update,
       { new: true }
     );
     if (!user) return res.status(404).json({ error: 'User not found for this Stripe customer' });
-    res.json({ isPremium: user.isPremium });
+    res.json({ isPremium: user.isPremium, trialEnd: user.trialEnd });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Called by nutricrew-backend before creating a Checkout Session: lets it
+// decide whether this email is eligible for a free trial (never checked out
+// before) or should skip straight to a paid subscription (returning Stripe
+// customer — see the trial-abuse guard in create-checkout-session).
+app.get('/api/user/stripe-customer', requireInternal, async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email || typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: 'Valid email is required' });
+    }
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail }).select('stripeCustomerId').lean();
+    res.json({ stripeCustomerId: user?.stripeCustomerId || null });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -424,7 +452,7 @@ app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) =>
     if (user.emailVerified) {
       const sessionToken = crypto.randomBytes(32).toString('hex');
       await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null });
-      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
+      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
     }
 
     const expiry = new Date(Date.now() + 10 * 60 * 1000);
@@ -466,7 +494,7 @@ app.post('/api/auth/check-otp', requireInternal, async (req, res) => {
     };
     if (clientIP && !user.registeredIP) updates.registeredIP = clientIP;
     await User.updateOne({ email: normalizedEmail }, updates);
-    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -492,7 +520,7 @@ app.post('/api/auth/check-password', requireInternal, passwordLimiter, async (re
     }
     const sessionToken = crypto.randomBytes(32).toString('hex');
     await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null, passwordAttempts: 0 });
-    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0 });
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -533,7 +561,7 @@ app.post('/api/auth/check-session', requireInternal, async (req, res) => {
     if (user.sessionExpiry && new Date() > user.sessionExpiry) {
       return res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
-    res.json({ email: user.email, name: user.name, isPremium: user.isPremium, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0 });
+    res.json({ email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
