@@ -20,10 +20,16 @@ const FRONTEND_URL = process.env.FRONTEND_URL || "https://nutricrew-frontend.ver
 const CRUD_SELF_URL = process.env.CRUD_SELF_URL || "https://nutricrew-server-1.onrender.com";
 const FREE_PAIRING_LIMIT = 1;
 
-// "YYYY-MM" key for the current calendar month — the free tier renews on this boundary.
-function currentMonthKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+// Single source of truth for "can this user generate a pairing right now?" —
+// used identically by /api/pairing-usage/check (called before generation)
+// and anywhere else that needs the same allow/block decision, so the check
+// endpoint and the increment endpoint can never disagree.
+function canGeneratePairing(user) {
+  const isPremium = !!user?.isPremium;
+  const pairingCount = user?.pairingCount || 0;
+  const bonusPairings = user?.bonusPairings || 0;
+  const allowed = isPremium || pairingCount < FREE_PAIRING_LIMIT + bonusPairings;
+  return { allowed, isPremium, pairingCount, bonusPairings };
 }
 
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
@@ -31,6 +37,19 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 }
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
+
+// Durable cross-pairing profile defaults. Kitchen access is deliberately
+// excluded — it's per-pairing-day, not a saved profile default.
+const PROFILE_FIELDS = [
+  'gender', 'weight', 'dob', 'position', 'lunchBag', 'cookingPref',
+  'diets', 'dietOther', 'goals', 'calorieTarget', 'calorieDeficitAmount',
+  'calorieDeficitPreset', 'departure', 'budgetType', 'budgetAmount',
+];
+function profileFieldsOf(user) {
+  const out = {};
+  for (const f of PROFILE_FIELDS) out[f] = user[f];
+  return out;
+}
 
 app.set('trust proxy', 1);
 app.use(compression());
@@ -87,10 +106,7 @@ const userSchema = new mongoose.Schema(
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true },
-    pairingCount: { type: Number, default: 0 },
-    // "YYYY-MM" for the month pairingCount currently applies to — lets the free
-    // tier renew monthly instead of being a lifetime limit.
-    pairingCountMonth: { type: String, default: null },
+    pairingCount: { type: Number, default: 0 }, // lifetime count — free tier is 1 pairing ever
     isPremium: { type: Boolean, default: false },
     stripeCustomerId: { type: String, default: null, index: true },
     stripeSubscriptionId: { type: String, default: null },
@@ -111,6 +127,25 @@ const userSchema = new mongoose.Schema(
     referralCode: { type: String, default: undefined, unique: true, sparse: true },
     bonusPairings: { type: Number, default: 0 },
     referredBy: { type: String, default: null },
+    // Saved profile preferences — set once (onboarding or profile settings),
+    // pre-fill every new pairing instead of being re-entered from scratch.
+    // Only durable across-pairing defaults live here; kitchen access is
+    // deliberately per-pairing-day (not a profile default) and excluded.
+    budgetType: { type: String, default: null },
+    budgetAmount: { type: String, default: null },
+    gender: { type: String, default: null },
+    weight: { type: String, default: null },
+    dob: { type: String, default: null },
+    position: { type: String, default: null },
+    lunchBag: { type: String, default: null },
+    cookingPref: { type: String, default: null },
+    diets: { type: [String], default: undefined },
+    dietOther: { type: String, default: null },
+    goals: { type: [String], default: undefined },
+    calorieTarget: { type: String, default: null },
+    calorieDeficitAmount: { type: String, default: null },
+    calorieDeficitPreset: { type: String, default: null },
+    departure: { type: String, default: null },
   },
   { timestamps: true }
 );
@@ -330,20 +365,15 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
     }
 
     const normalizedEmail = email.toLowerCase().trim();
-    const nowMonth = currentMonthKey();
 
     let user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       const placeholderPassword = await bcrypt.hash(crypto.randomUUID(), 10);
-      user = await User.create({ name: name || normalizedEmail, email: normalizedEmail, password: placeholderPassword, pairingCountMonth: nowMonth });
-    } else if (user.pairingCountMonth !== nowMonth) {
-      user.pairingCount = 0;
-      user.pairingCountMonth = nowMonth;
-      await user.save();
+      user = await User.create({ name: name || normalizedEmail, email: normalizedEmail, password: placeholderPassword });
     }
 
-    const allowed = user.isPremium || user.pairingCount < FREE_PAIRING_LIMIT + (user.bonusPairings || 0);
-    res.json({ allowed, pairingCount: user.pairingCount, isPremium: user.isPremium, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
+    const { allowed, isPremium, pairingCount, bonusPairings } = canGeneratePairing(user);
+    res.json({ allowed, pairingCount, isPremium, bonusPairings, hasPassword: !!user.passwordSetAt });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -452,7 +482,7 @@ app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) =>
     if (user.emailVerified) {
       const sessionToken = crypto.randomBytes(32).toString('hex');
       await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null });
-      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
+      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
     }
 
     const expiry = new Date(Date.now() + 10 * 60 * 1000);
@@ -494,7 +524,7 @@ app.post('/api/auth/check-otp', requireInternal, async (req, res) => {
     };
     if (clientIP && !user.registeredIP) updates.registeredIP = clientIP;
     await User.updateOne({ email: normalizedEmail }, updates);
-    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -520,7 +550,7 @@ app.post('/api/auth/check-password', requireInternal, passwordLimiter, async (re
     }
     const sessionToken = crypto.randomBytes(32).toString('hex');
     await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null, passwordAttempts: 0 });
-    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0 });
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -561,7 +591,31 @@ app.post('/api/auth/check-session', requireInternal, async (req, res) => {
     if (user.sessionExpiry && new Date() > user.sessionExpiry) {
       return res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
-    res.json({ email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0 });
+    res.json({ email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/profile/update', requireInternal, async (req, res) => {
+  try {
+    const { email, ...fields } = req.body;
+    if (!email || typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    const normalizedEmail = email.toLowerCase().trim();
+    const update = {};
+    for (const f of PROFILE_FIELDS) {
+      if (fields[f] !== undefined) update[f] = fields[f];
+    }
+    const user = await User.findOneAndUpdate(
+      { email: normalizedEmail },
+      update,
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(profileFieldsOf(user));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -577,21 +631,12 @@ app.post('/api/pairing-usage/increment', requireInternal, async (req, res) => {
     }
 
     const normalizedEmail = email.toLowerCase().trim();
-    const nowMonth = currentMonthKey();
-    const existing = await User.findOne({ email: normalizedEmail });
-    if (!existing) return res.status(404).json({ error: 'User not found' });
-
-    const user = existing.pairingCountMonth !== nowMonth
-      ? await User.findOneAndUpdate(
-          { email: normalizedEmail },
-          { $set: { pairingCount: 1, pairingCountMonth: nowMonth } },
-          { new: true }
-        )
-      : await User.findOneAndUpdate(
-          { email: normalizedEmail },
-          { $inc: { pairingCount: 1 } },
-          { new: true }
-        );
+    const user = await User.findOneAndUpdate(
+      { email: normalizedEmail },
+      { $inc: { pairingCount: 1 } },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
     res.json({ pairingCount: user.pairingCount, isPremium: user.isPremium });
   } catch (err) {
