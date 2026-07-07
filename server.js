@@ -38,12 +38,11 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
 
-// Durable cross-pairing profile defaults. Kitchen access is deliberately
-// excluded — it's per-pairing-day, not a saved profile default.
+// Durable cross-pairing profile defaults.
 const PROFILE_FIELDS = [
   'gender', 'weight', 'dob', 'position', 'lunchBag', 'cookingPref',
   'diets', 'dietOther', 'goals', 'calorieTarget', 'calorieDeficitAmount',
-  'calorieDeficitPreset', 'departure', 'budgetType', 'budgetAmount',
+  'calorieDeficitPreset', 'departure', 'budgetType', 'budgetAmount', 'kitchen',
 ];
 function profileFieldsOf(user) {
   const out = {};
@@ -129,8 +128,9 @@ const userSchema = new mongoose.Schema(
     referredBy: { type: String, default: null },
     // Saved profile preferences — set once (onboarding or profile settings),
     // pre-fill every new pairing instead of being re-entered from scratch.
-    // Only durable across-pairing defaults live here; kitchen access is
-    // deliberately per-pairing-day (not a profile default) and excluded.
+    // `kitchen` is a rolled-up default (kitchen access can still differ by
+    // pairing-day within a trip — see kitchen_day_N on the frontend — but
+    // this is what pre-fills a new pairing's days).
     budgetType: { type: String, default: null },
     budgetAmount: { type: String, default: null },
     gender: { type: String, default: null },
@@ -146,6 +146,7 @@ const userSchema = new mongoose.Schema(
     calorieDeficitAmount: { type: String, default: null },
     calorieDeficitPreset: { type: String, default: null },
     departure: { type: String, default: null },
+    kitchen: { type: [String], default: undefined },
   },
   { timestamps: true }
 );
