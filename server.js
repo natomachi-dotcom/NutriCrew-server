@@ -381,6 +381,68 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
   }
 });
 
+// Atomically checks-and-consumes a free pairing slot in one DB operation.
+// /api/pairing-usage/check + a later /increment (the old two-step flow) has
+// a race: two concurrent requests can both read "allowed" before either has
+// incremented, letting a free-tier user generate more than their limit. This
+// closes that by making MongoDB's own document-level serialization decide
+// which concurrent request wins — only one can match `pairingCount < limit`
+// and apply the $inc; the other reads the already-incremented count and is
+// correctly denied. If generation fails afterward, call /release to give
+// the slot back (a failed attempt shouldn't cost the user their free pairing).
+app.post('/api/pairing-usage/reserve', requireInternal, async (req, res) => {
+  try {
+    const { email, name } = req.body;
+    if (!email) return res.status(400).json({ error: 'email is required' });
+    if (typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    const normalizedEmail = email.toLowerCase().trim();
+
+    let user = await User.findOne({ email: normalizedEmail });
+    if (!user) {
+      const placeholderPassword = await bcrypt.hash(crypto.randomUUID(), 10);
+      user = await User.create({ name: name || normalizedEmail, email: normalizedEmail, password: placeholderPassword });
+    }
+
+    if (user.isPremium) {
+      return res.json({ allowed: true, isPremium: true, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
+    }
+
+    const limit = FREE_PAIRING_LIMIT + (user.bonusPairings || 0);
+    const reserved = await User.findOneAndUpdate(
+      { email: normalizedEmail, pairingCount: { $lt: limit } },
+      { $inc: { pairingCount: 1 } },
+      { new: true }
+    );
+    if (!reserved) {
+      return res.json({ allowed: false, isPremium: false, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
+    }
+    res.json({ allowed: true, isPremium: false, pairingCount: reserved.pairingCount, bonusPairings: reserved.bonusPairings || 0, hasPassword: !!reserved.passwordSetAt });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/pairing-usage/release', requireInternal, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email is required' });
+    if (typeof email !== 'string' || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    await User.findOneAndUpdate(
+      { email: email.toLowerCase().trim(), pairingCount: { $gt: 0 } },
+      { $inc: { pairingCount: -1 } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.post('/api/set-premium', requireInternal, async (req, res) => {
   try {
     const { email, stripeCustomerId, stripeSubscriptionId, trialEnd } = req.body;
