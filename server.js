@@ -18,7 +18,10 @@ const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const AI_API_BASE = process.env.AI_API_BASE || "https://nutricrew-backend.vercel.app";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://nutricrew-frontend.vercel.app";
 const CRUD_SELF_URL = process.env.CRUD_SELF_URL || "https://nutricrew-server-1.onrender.com";
-const FREE_PAIRING_LIMIT = 1;
+// No free pairing: new users must start the card-required free month (30-day
+// Stripe trial) to generate anything. Referral bonuses still grant free
+// pairings on top of this (see bonusPairings in canGeneratePairing).
+const FREE_PAIRING_LIMIT = 0;
 
 // Single source of truth for "can this user generate a pairing right now?" —
 // used identically by /api/pairing-usage/check (called before generation)
@@ -105,7 +108,7 @@ const userSchema = new mongoose.Schema(
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true },
-    pairingCount: { type: Number, default: 0 }, // lifetime count — free tier is 1 pairing ever
+    pairingCount: { type: Number, default: 0 }, // lifetime count — no free tier; only referral bonusPairings grant free plans
     isPremium: { type: Boolean, default: false },
     stripeCustomerId: { type: String, default: null, index: true },
     stripeSubscriptionId: { type: String, default: null },
