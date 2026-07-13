@@ -44,7 +44,7 @@ const MIN_PASSWORD_LENGTH = 8;
 // Durable cross-pairing profile defaults.
 const PROFILE_FIELDS = [
   'gender', 'weight', 'dob', 'position', 'lunchBag', 'cookingPref',
-  'diets', 'dietOther', 'goals', 'calorieTarget', 'calorieDeficitAmount',
+  'diets', 'dietOther', 'allergyOtherText', 'goals', 'calorieTarget', 'calorieDeficitAmount',
   'calorieDeficitPreset', 'departure', 'budgetType', 'budgetAmount', 'kitchen',
 ];
 function profileFieldsOf(user) {
@@ -144,6 +144,7 @@ const userSchema = new mongoose.Schema(
     cookingPref: { type: String, default: null },
     diets: { type: [String], default: undefined },
     dietOther: { type: String, default: null },
+    allergyOtherText: { type: String, default: null },
     goals: { type: [String], default: undefined },
     calorieTarget: { type: String, default: null },
     calorieDeficitAmount: { type: String, default: null },
