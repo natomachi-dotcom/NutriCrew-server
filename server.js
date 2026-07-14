@@ -18,10 +18,16 @@ const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const AI_API_BASE = process.env.AI_API_BASE || "https://nutricrew-backend.vercel.app";
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://nutricrew-frontend.vercel.app";
 const CRUD_SELF_URL = process.env.CRUD_SELF_URL || "https://nutricrew-server-1.onrender.com";
-// No free pairing: new users must start the card-required free month (30-day
-// Stripe trial) to generate anything. Referral bonuses still grant free
-// pairings on top of this (see bonusPairings in canGeneratePairing).
-const FREE_PAIRING_LIMIT = 0;
+// Two-stage funnel: a brand-new user gets exactly 1 free pairing with no card
+// and no paywall (STAGE 1). Their second pairing attempt hits the paywall,
+// which starts the card-required 30-day Stripe trial (STAGE 2). Referral
+// bonuses still grant free pairings on top of this (see bonusPairings in
+// canGeneratePairing) — the "freePairingUsed" concept from the product spec
+// is realized as pairingCount >= FREE_PAIRING_LIMIT rather than a separate
+// boolean field, reusing the existing atomic reserve/release mechanism
+// instead of introducing a second piece of state that could drift out of
+// sync with it.
+const FREE_PAIRING_LIMIT = 1;
 
 // Single source of truth for "can this user generate a pairing right now?" —
 // used identically by /api/pairing-usage/check (called before generation)
