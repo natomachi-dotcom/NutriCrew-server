@@ -33,12 +33,18 @@ const FREE_PAIRING_LIMIT = 1;
 // used identically by /api/pairing-usage/check (called before generation)
 // and anywhere else that needs the same allow/block decision, so the check
 // endpoint and the increment endpoint can never disagree.
+//
+// needsPremium (the inverse of allowed) is deliberately exposed here so
+// every response that carries user state can include it directly — this is
+// the ONLY place FREE_PAIRING_LIMIT is ever compared against pairingCount.
+// The frontend must treat needsPremium as an opaque boolean copied from the
+// server, never re-derive it from its own limit constant (there isn't one).
 function canGeneratePairing(user) {
   const isPremium = !!user?.isPremium;
   const pairingCount = user?.pairingCount || 0;
   const bonusPairings = user?.bonusPairings || 0;
   const allowed = isPremium || pairingCount < FREE_PAIRING_LIMIT + bonusPairings;
-  return { allowed, isPremium, pairingCount, bonusPairings };
+  return { allowed, needsPremium: !allowed, isPremium, pairingCount, bonusPairings };
 }
 
 if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
@@ -383,8 +389,8 @@ app.post('/api/pairing-usage/check', requireInternal, async (req, res) => {
       user = await User.create({ name: name || normalizedEmail, email: normalizedEmail, password: placeholderPassword });
     }
 
-    const { allowed, isPremium, pairingCount, bonusPairings } = canGeneratePairing(user);
-    res.json({ allowed, pairingCount, isPremium, bonusPairings, hasPassword: !!user.passwordSetAt });
+    const { allowed, needsPremium, isPremium, pairingCount, bonusPairings } = canGeneratePairing(user);
+    res.json({ allowed, needsPremium, pairingCount, isPremium, bonusPairings, hasPassword: !!user.passwordSetAt });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -416,7 +422,7 @@ app.post('/api/pairing-usage/reserve', requireInternal, async (req, res) => {
     }
 
     if (user.isPremium) {
-      return res.json({ allowed: true, isPremium: true, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
+      return res.json({ allowed: true, needsPremium: false, isPremium: true, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
     }
 
     const limit = FREE_PAIRING_LIMIT + (user.bonusPairings || 0);
@@ -426,9 +432,13 @@ app.post('/api/pairing-usage/reserve', requireInternal, async (req, res) => {
       { new: true }
     );
     if (!reserved) {
-      return res.json({ allowed: false, isPremium: false, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
+      return res.json({ allowed: false, needsPremium: true, isPremium: false, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt });
     }
-    res.json({ allowed: true, isPremium: false, pairingCount: reserved.pairingCount, bonusPairings: reserved.bonusPairings || 0, hasPassword: !!reserved.passwordSetAt });
+    // needsPremium reflects the account's state AFTER this reservation — i.e.
+    // whether its NEXT pairing attempt will need premium — so the frontend
+    // can update its cached copy right away instead of waiting to find out
+    // the hard way on the next click.
+    res.json({ allowed: true, needsPremium: canGeneratePairing(reserved).needsPremium, isPremium: false, pairingCount: reserved.pairingCount, bonusPairings: reserved.bonusPairings || 0, hasPassword: !!reserved.passwordSetAt });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -555,7 +565,7 @@ app.post('/api/auth/store-otp', requireInternal, otpLimiter, async (req, res) =>
     if (user.emailVerified) {
       const sessionToken = crypto.randomBytes(32).toString('hex');
       await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null });
-      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
+      return res.json({ alreadyVerified: true, token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, needsPremium: canGeneratePairing(user).needsPremium, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
     }
 
     const expiry = new Date(Date.now() + 10 * 60 * 1000);
@@ -597,7 +607,7 @@ app.post('/api/auth/check-otp', requireInternal, async (req, res) => {
     };
     if (clientIP && !user.registeredIP) updates.registeredIP = clientIP;
     await User.updateOne({ email: normalizedEmail }, updates);
-    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, needsPremium: canGeneratePairing(user).needsPremium, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -623,7 +633,7 @@ app.post('/api/auth/check-password', requireInternal, passwordLimiter, async (re
     }
     const sessionToken = crypto.randomBytes(32).toString('hex');
     await User.updateOne({ email: normalizedEmail }, { sessionToken, sessionExpiry: null, passwordAttempts: 0 });
-    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
+    res.json({ token: sessionToken, email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, needsPremium: canGeneratePairing(user).needsPremium, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -664,7 +674,7 @@ app.post('/api/auth/check-session', requireInternal, async (req, res) => {
     if (user.sessionExpiry && new Date() > user.sessionExpiry) {
       return res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
-    res.json({ email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
+    res.json({ email: user.email, name: user.name, isPremium: user.isPremium, trialEnd: user.trialEnd, pairingCount: user.pairingCount, bonusPairings: user.bonusPairings || 0, needsPremium: canGeneratePairing(user).needsPremium, hasPassword: !!user.passwordSetAt, ...profileFieldsOf(user) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
