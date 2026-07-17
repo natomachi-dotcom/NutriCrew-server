@@ -19,14 +19,18 @@ const AI_API_BASE = process.env.AI_API_BASE || "https://nutricrew-backend.vercel
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://nutricrew-frontend.vercel.app";
 const CRUD_SELF_URL = process.env.CRUD_SELF_URL || "https://nutricrew-server-1.onrender.com";
 // Two-stage funnel: a brand-new user gets exactly 1 free pairing with no card
-// and no paywall (STAGE 1). Their second pairing attempt hits the paywall,
-// which starts the card-required 30-day Stripe trial (STAGE 2). Referral
-// bonuses still grant free pairings on top of this (see bonusPairings in
-// canGeneratePairing) — the "freePairingUsed" concept from the product spec
-// is realized as pairingCount >= FREE_PAIRING_LIMIT rather than a separate
-// boolean field, reusing the existing atomic reserve/release mechanism
-// instead of introducing a second piece of state that could drift out of
-// sync with it.
+// and no paywall (STAGE 1). Their second pairing attempt hits the paywall
+// (STAGE 2), which starts a paid subscription immediately — or, if
+// nutricrew-backend's TRIAL_ENABLED flag is switched on for a campaign, a
+// card-required 30-day Stripe trial instead (see TRIAL_ENABLED in
+// nutricrew-backend/server.js; this repo doesn't need its own copy of that
+// flag since it only ever looks at isPremium, which is true either way).
+// Referral bonuses still grant free pairings on top of this (see
+// bonusPairings in canGeneratePairing) — the "freePairingUsed" concept from
+// the product spec is realized as pairingCount >= FREE_PAIRING_LIMIT rather
+// than a separate boolean field, reusing the existing atomic reserve/release
+// mechanism instead of introducing a second piece of state that could drift
+// out of sync with it.
 const FREE_PAIRING_LIMIT = 1;
 
 // Single source of truth for "can this user generate a pairing right now?" —
@@ -39,6 +43,17 @@ const FREE_PAIRING_LIMIT = 1;
 // the ONLY place FREE_PAIRING_LIMIT is ever compared against pairingCount.
 // The frontend must treat needsPremium as an opaque boolean copied from the
 // server, never re-derive it from its own limit constant (there isn't one).
+//
+// Gating rule, spelled out: allowed = (isPremium OR trialing) OR (pairingCount
+// < free limit). There's no separate "trialing" field to check here — the
+// Stripe webhook in nutricrew-backend/server.js already folds a "trialing"
+// subscription status into isPremium (see PREMIUM_STATUSES there), so
+// isPremium alone already covers both a paid subscriber and someone mid-trial.
+// That's deliberate: this stays the ONLY place gating is decided even while
+// nutricrew-backend's TRIAL_ENABLED flag is off (no trials being created) or
+// on (trials created, still just isPremium here). user?.isPremium / .pairingCount
+// default safely to false/0 via optional chaining + `|| 0`, so a brand-new
+// user record with those fields still unset is never wrongly blocked.
 function canGeneratePairing(user) {
   const isPremium = !!user?.isPremium;
   const pairingCount = user?.pairingCount || 0;
