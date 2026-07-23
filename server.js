@@ -348,10 +348,18 @@ app.get('/api/users/:id', requireAdmin, async (req, res) => {
 
 app.put('/api/users/:id', requireAdmin, async (req, res) => {
   try {
-    const { name, email } = req.body;
+    const { name, email, pairingCount, bonusPairings } = req.body;
+    const update = { name, email };
+    // Support fix for a stuck free pairing (e.g. a client-side timeout that
+    // consumed the reservation without ever delivering a plan — see the
+    // release-on-disconnect fix in nutricrew-backend/server.js): only touch
+    // these when explicitly provided, so ordinary name/email edits can't
+    // accidentally reset a paying-in-progress user's usage.
+    if (pairingCount !== undefined) update.pairingCount = pairingCount;
+    if (bonusPairings !== undefined) update.bonusPairings = bonusPairings;
     const user = await User.findByIdAndUpdate(
       req.params.id,
-      { name, email },
+      update,
       { new: true, runValidators: true }
     ).select('-password');
     if (!user) return res.status(404).json({ error: 'User not found' });
