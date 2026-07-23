@@ -348,7 +348,7 @@ app.get('/api/users/:id', requireAdmin, async (req, res) => {
 
 app.put('/api/users/:id', requireAdmin, async (req, res) => {
   try {
-    const { name, email, pairingCount, bonusPairings } = req.body;
+    const { name, email, pairingCount, bonusPairings, isPremium } = req.body;
     const update = { name, email };
     // Support fix for a stuck free pairing (e.g. a client-side timeout that
     // consumed the reservation without ever delivering a plan — see the
@@ -357,6 +357,12 @@ app.put('/api/users/:id', requireAdmin, async (req, res) => {
     // accidentally reset a paying-in-progress user's usage.
     if (pairingCount !== undefined) update.pairingCount = pairingCount;
     if (bonusPairings !== undefined) update.bonusPairings = bonusPairings;
+    // Manual comp access — grants premium without a real Stripe charge, for
+    // testers once the account is switched to live keys (4242 stops working
+    // then, same as for everyone else). Deliberately does NOT touch
+    // stripeCustomerId/stripeSubscriptionId: a comped account has no real
+    // subscription behind it, so nothing here should ever look like one.
+    if (isPremium !== undefined) update.isPremium = !!isPremium;
     const user = await User.findByIdAndUpdate(
       req.params.id,
       update,
